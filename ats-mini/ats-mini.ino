@@ -466,14 +466,27 @@ bool updateBFO(int newBFO, bool wrap)
     newBFO  = 0;
   }
 
-  // If need to change frequency, mute before touching the chip.
-  // Keep muted through the BFO update so the audio path only opens after
-  // both the carrier and BFO have settled (prevents the loud pop every
-  // MAX_BFO Hz in SSB mode when the BFO overflows and the carrier jumps).
+  // When the BFO value overflows MAX_BFO the carrier frequency must jump by
+  // MAX_BFO kHz (PLL relock).  tuneMute() only gates the AUDIO_MUTE circuit;
+  // it does NOT disable the NS4160 amplifier (PIN_AMP_EN).  With the amp
+  // still powered the PLL-relock transient reaches the speaker as a loud pop.
+  //
+  // To silence it we mirror what muteOn(MUTE_TEMP) does: disable the amp
+  // before touching the chip and re-enable it after both the carrier and the
+  // BFO have settled.  We check PIN_AMP_EN first so we don't accidentally
+  // re-enable the amp when an outer caller (e.g. doSeek) already disabled it.
   bool retuned = (newFreq != currentFrequency);
+  bool ampWasEnabled = false;
   if(retuned)
   {
     tuneMute(true);
+    // Disable amp only if it is currently on (re-entrancy guard for doSeek)
+    ampWasEnabled = (digitalRead(PIN_AMP_EN) == HIGH);
+    if(ampWasEnabled)
+    {
+      digitalWrite(PIN_AMP_EN, LOW);
+      delay(50);
+    }
 
     // Apply new frequency
     rx.setFrequency(newFreq);
@@ -485,12 +498,10 @@ bool updateBFO(int newBFO, bool wrap)
     currentFrequency = (uint16_t)newFreq;
   }
 
-  // Update current BFO
+  // Update current BFO while the audio path is still fully silenced
   currentBFO = newBFO;
 
-  // To move frequency forward, need to move the BFO backwards.
-  // This runs while the audio is still muted (if we retuned above), so the
-  // BFO oscillator sweep is never audible.
+  // To move frequency forward, need to move the BFO backwards
   if (currentMode == USB)
     rx.setSSBBfo(-(currentBFO + band->usbCal));
   else if (currentMode == LSB)
@@ -498,8 +509,16 @@ bool updateBFO(int newBFO, bool wrap)
   else
     rx.setSSBBfo(-currentBFO);  // No calibration if not USB/LSB
 
-  // Now that both carrier and BFO are correct, restore audio
-  if(retuned) tuneMute(false);
+  // Restore audio now that both carrier and BFO are settled
+  if(retuned)
+  {
+    tuneMute(false);
+    if(ampWasEnabled)
+    {
+      delay(50);
+      digitalWrite(PIN_AMP_EN, HIGH);
+    }
+  }
 
   // Save current band frequency, w.r.t. new BFO value
   band->currentFreq = currentFrequency + currentBFO / 1000;
