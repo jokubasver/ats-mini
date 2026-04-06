@@ -5,6 +5,7 @@
 #define VBAT_MON  4                 // GPIO04 -- Battery Monitor PIN
 
 #define BATT_ADC_READS          10  // ADC reads for average calculation (Maximum value = 16 to avoid rollover in average calculation)
+#define BATT_REFRESH_TIME    10000  // Minimum ms between ADC samples (battery voltage changes slowly)
 #define BATT_ADC_FACTOR      1.702  // ADC correction factor used for the battery monitor
 #define BATT_SOC_LEVEL1      3.680  // Battery SOC voltage for 25%
 #define BATT_SOC_LEVEL2      3.780  // Battery SOC voltage for 50%
@@ -23,7 +24,15 @@ static float batteryVolts = 4.0;
 //
 float batteryMonitor()
 {
+  static uint32_t lastBattCheck = 0;
   int i, j;
+
+  // Re-sample ADC periodically; battery voltage changes slowly so per-frame
+  // sampling is unnecessary and wastes ~1-2 ms per frame.
+  uint32_t now = millis();
+  if(batteryState != 255 /* illegal/uninitialized */ && now - lastBattCheck < BATT_REFRESH_TIME)
+    return batteryVolts;
+  lastBattCheck = now;
 
   // Read ADC multiple times
   for(i=j=0 ; i<BATT_ADC_READS ; i++) j += analogRead(VBAT_MON);

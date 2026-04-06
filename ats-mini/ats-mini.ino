@@ -471,8 +471,9 @@ bool updateBFO(int newBFO, bool wrap)
 
     // Re-apply to remove noise
     doAgc(0);
-    // Update current frequency
-    currentFrequency = rx.getFrequency();
+    // Use the requested frequency directly; the chip tunes to exactly newFreq
+    // on a non-seek setFrequency(), so a read-back I2C round-trip is redundant.
+    currentFrequency = (uint16_t)newFreq;
   }
 
   // Update current BFO
@@ -514,8 +515,9 @@ bool updateFrequency(int newFreq, bool wrap)
   // Clear BFO, if present
   if(currentBFO) updateBFO(0, true);
 
-  // Update current frequency
-  currentFrequency = rx.getFrequency();
+  // Use the requested frequency directly; the chip tunes to exactly newFreq
+  // on a non-seek setFrequency(), so a read-back I2C round-trip is redundant.
+  currentFrequency = (uint16_t)newFreq;
 
   // Save current band frequency
   band->currentFreq = currentFrequency + currentBFO / 1000;
@@ -699,6 +701,20 @@ bool processRssiSnr()
   static uint32_t updateCounter = 0;
   bool needRedraw = false;
 
+  // 1-in-8 counter: update the display and do a full I2C read once per 1.6 s
+  // (8 × MIN_ELAPSED_RSSI_TIME = 8 × 200 ms).
+  bool doDisplayUpdate = !(updateCounter++ & 7);
+
+  // Skip I2C read if squelch is disabled and the display update is not due.
+  // 7 out of every 8 calls (every 200 ms) are skipped in that case,
+  // reducing SI4732 I2C traffic without affecting squelch response.
+  if(!currentSquelch && !doDisplayUpdate)
+  {
+    // Clear any lingering squelch mute if squelch was disabled while muted
+    if(muteOn(MUTE_SQUELCH)) muteOn(MUTE_SQUELCH, false);
+    return false;
+  }
+
   rx.getCurrentReceivedSignalQuality();
   int newRSSI = rx.getCurrentRSSI();
   int newSNR = rx.getCurrentSNR();
@@ -721,7 +737,7 @@ bool processRssiSnr()
   }
 
   // G8PTN: Based on 1.2s interval, update RSSI & SNR
-  if(!(updateCounter++ & 7))
+  if(doDisplayUpdate)
   {
     // Show RSSI status only if this condition has changed
     if(newRSSI != rssi)
