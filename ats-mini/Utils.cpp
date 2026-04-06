@@ -87,6 +87,26 @@ void unloadSSB()
 }
 
 //
+// Lightweight mute for frequency changes.
+// Controls only the AUDIO_MUTE hardware circuit (GPIO3 via the SI4732 mute
+// pin registered with setAudioMuteMcuPin).  Does NOT touch PIN_AMP_EN and
+// adds no delays, so it is safe to call on every encoder tick.
+// On unmute, skips the GPIO write if MUTE_MAIN or MUTE_SQUELCH is holding
+// the mute active so we don't accidentally ungate a squelched or user-muted
+// audio path.
+//
+void tuneMute(bool on)
+{
+  if(on) {
+    // Gate the hardware mute circuit to suppress the PLL-relock transient
+    rx.setAudioMute(true);
+  } else if(!muteOn(MUTE_MAIN) && !muteOn(MUTE_SQUELCH)) {
+    // Only release when no persistent mute is active
+    rx.setAudioMute(false);
+  }
+}
+
+//
 // Mute sound on (x=1) or off (x=0), or get current status (x=2)
 // Do not call this too often because a short PIN_AMP_EN impulse can trigger amplifier mode D,
 // see the NS4160 datasheet https://esp32-si4732.github.io/ats-mini/hardware.html#datasheets

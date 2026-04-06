@@ -466,6 +466,9 @@ bool updateBFO(int newBFO, bool wrap)
   // If need to change frequency...
   if(newFreq != currentFrequency)
   {
+    // Mute audio to suppress the SI4732 PLL-relock transient
+    tuneMute(true);
+
     // Apply new frequency
     rx.setFrequency(newFreq);
 
@@ -474,6 +477,8 @@ bool updateBFO(int newBFO, bool wrap)
     // Use the requested frequency directly; the chip tunes to exactly newFreq
     // on a non-seek setFrequency(), so a read-back I2C round-trip is redundant.
     currentFrequency = (uint16_t)newFreq;
+
+    tuneMute(false);
   }
 
   // Update current BFO
@@ -509,6 +514,9 @@ bool updateFrequency(int newFreq, bool wrap)
     if(!wrap) return false; else newFreq = band->minimumFreq;
   }
 
+  // Mute audio to suppress the SI4732 PLL-relock transient
+  tuneMute(true);
+
   // Set new frequency
   rx.setFrequency(newFreq);
 
@@ -521,6 +529,8 @@ bool updateFrequency(int newFreq, bool wrap)
 
   // Save current band frequency
   band->currentFreq = currentFrequency + currentBFO / 1000;
+
+  tuneMute(false);
   return true;
 }
 

@@ -25,6 +25,11 @@ int getStrength(int rssi);
 bool sleepOn(int x = 2);
 bool muteOn(uint8_t mode, int x = 2);
 
+// Lightweight mute used around rx.setFrequency() calls during tuning.
+// Only gates the AUDIO_MUTE circuit (GPIO3) – does not touch PIN_AMP_EN
+// and adds no delays, so it is safe to call on every encoder tick.
+void tuneMute(bool on);
+
 // Wall clock functions
 const char *clockGet();
 bool clockAvailable();
