@@ -134,8 +134,8 @@ void setup()
   // TFT display brightness control (PWM)
   // Note: At brightness levels below 100%, switching from the PWM may cause power spikes and/or RFI.
   // The PWM frequency is set near the 8-bit maximum (~312 kHz on a 80 MHz APB clock) to push
-  // the harmonics far apart (one every ~300 kHz) across the MW/SW spectrum, instead of the
-  // original 16 kHz which placed a harmonic every 16 kHz — audible as a pop every ~16 kHz of scroll.
+  // the harmonics far apart (one every ~300 kHz) across the MW/SW spectrum, reducing the
+  // likelihood of backlight RFI landing on a tuned frequency.
   ledcAttach(PIN_LCD_BL, 300000, 8);  // Pin assignment, ~300kHz, 8-bit
   ledcWrite(PIN_LCD_BL, 0);          // Default value 0%
 
@@ -466,34 +466,40 @@ bool updateBFO(int newBFO, bool wrap)
     newBFO  = 0;
   }
 
-  // If need to change frequency...
-  if(newFreq != currentFrequency)
+  // If need to change frequency, mute before touching the chip.
+  // Keep muted through the BFO update so the audio path only opens after
+  // both the carrier and BFO have settled (prevents the loud pop every
+  // MAX_BFO Hz in SSB mode when the BFO overflows and the carrier jumps).
+  bool retuned = (newFreq != currentFrequency);
+  if(retuned)
   {
-    // Mute audio to suppress the SI4732 PLL-relock transient
     tuneMute(true);
 
     // Apply new frequency
     rx.setFrequency(newFreq);
 
-    // Re-apply to remove noise
+    // Re-apply AGC settings which the tune command may have reset
     doAgc(0);
     // Use the requested frequency directly; the chip tunes to exactly newFreq
     // on a non-seek setFrequency(), so a read-back I2C round-trip is redundant.
     currentFrequency = (uint16_t)newFreq;
-
-    tuneMute(false);
   }
 
   // Update current BFO
   currentBFO = newBFO;
 
-  // To move frequency forward, need to move the BFO backwards
+  // To move frequency forward, need to move the BFO backwards.
+  // This runs while the audio is still muted (if we retuned above), so the
+  // BFO oscillator sweep is never audible.
   if (currentMode == USB)
     rx.setSSBBfo(-(currentBFO + band->usbCal));
   else if (currentMode == LSB)
     rx.setSSBBfo(-(currentBFO + band->lsbCal));
   else
     rx.setSSBBfo(-currentBFO);  // No calibration if not USB/LSB
+
+  // Now that both carrier and BFO are correct, restore audio
+  if(retuned) tuneMute(false);
 
   // Save current band frequency, w.r.t. new BFO value
   band->currentFreq = currentFrequency + currentBFO / 1000;
