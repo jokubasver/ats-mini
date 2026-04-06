@@ -33,9 +33,8 @@ static int getInterpolatedStrength(int rssi)
       if(!i) return values[i];
       int interval = thresholds[i] - thresholds[i-1];
       if(!interval) return values[i];
-      float position = (float)(rssi - thresholds[i-1]) / interval;
-      float interpolated = values[i-1] + position * (values[i] - values[i-1]);
-      return (int)(interpolated + 0.5);
+      int range = values[i] - values[i-1];
+      return values[i-1] + ((rssi - thresholds[i-1]) * range + interval / 2) / interval;
     }
   }
 
@@ -139,7 +138,7 @@ static void drawLargeSNMeter(int snr, int x, int y)
   spr.drawNumber(snr, x - 15, 16 + y, 4);
 
   // SN-Meter
-  int snrbars = snr * 45 / 128.0;
+  int snrbars = snr * 45 / 128;
   for(int i=0; i<49; i++)
     if (i<snrbars)
       spr.fillRect(x+(i*5), y - 1, 3, 10, TH.smeter_bar);

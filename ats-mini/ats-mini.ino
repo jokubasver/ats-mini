@@ -965,15 +965,18 @@ void loop()
     elapsedRSSI = currentTime;
   }
 
-  // Periodically check received RDS information
-  if((currentTime - lastRDSCheck) > RDS_CHECK_TIME)
+  // Periodically check received RDS information.
+  // Skip while display is sleeping: the station name and radio text
+  // are not shown, and the RDS I2C poll is unnecessary overhead.
+  if(!sleepOn() && (currentTime - lastRDSCheck) > RDS_CHECK_TIME)
   {
     needRedraw |= (currentMode == FM) && (snr >= 12) && checkRds();
     lastRDSCheck = currentTime;
   }
 
-  // Periodically check schedule
-  if((currentTime - lastScheduleCheck) > SCHEDULE_CHECK_TIME)
+  // Periodically check schedule.
+  // Skip while display is sleeping for the same reason.
+  if(!sleepOn() && (currentTime - lastScheduleCheck) > SCHEDULE_CHECK_TIME)
   {
     needRedraw |= identifyFrequency(currentFrequency + currentBFO / 1000, true);
     lastScheduleCheck = currentTime;
