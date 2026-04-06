@@ -480,13 +480,11 @@ bool updateBFO(int newBFO, bool wrap)
   if(retuned)
   {
     tuneMute(true);
-    // Disable amp only if it is currently on (re-entrancy guard for doSeek)
+    // Disable amp only if it is currently on (re-entrancy guard for doSeek).
+    // No pre-delay needed: the chip hasn't acted yet so there is nothing to
+    // suppress before the I2C commands start.
     ampWasEnabled = (digitalRead(PIN_AMP_EN) == HIGH);
-    if(ampWasEnabled)
-    {
-      digitalWrite(PIN_AMP_EN, LOW);
-      delay(50);
-    }
+    if(ampWasEnabled) digitalWrite(PIN_AMP_EN, LOW);
 
     // Apply new frequency
     rx.setFrequency(newFreq);
@@ -509,13 +507,16 @@ bool updateBFO(int newBFO, bool wrap)
   else
     rx.setSSBBfo(-currentBFO);  // No calibration if not USB/LSB
 
-  // Restore audio now that both carrier and BFO are settled
+  // Restore audio now that both carrier and BFO are settled.
+  // The setFrequency + doAgc + setSSBBfo I2C transactions above already kept
+  // the amp off for several ms; a short post-settle delay (5 ms) is enough
+  // for the NS4160 to power back up into a stable audio signal.
   if(retuned)
   {
     tuneMute(false);
     if(ampWasEnabled)
     {
-      delay(50);
+      delay(5);
       digitalWrite(PIN_AMP_EN, HIGH);
     }
   }
