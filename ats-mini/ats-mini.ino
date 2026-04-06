@@ -132,8 +132,11 @@ void setup()
   Wire.begin(ESP32_I2C_SDA, ESP32_I2C_SCL);
 
   // TFT display brightness control (PWM)
-  // Note: At brightness levels below 100%, switching from the PWM may cause power spikes and/or RFI
-  ledcAttach(PIN_LCD_BL, 16000, 8);  // Pin assignment, 16kHz, 8-bit
+  // Note: At brightness levels below 100%, switching from the PWM may cause power spikes and/or RFI.
+  // The PWM frequency is set near the 8-bit maximum (~312 kHz on a 80 MHz APB clock) to push
+  // the harmonics far apart (one every ~300 kHz) across the MW/SW spectrum, instead of the
+  // original 16 kHz which placed a harmonic every 16 kHz — audible as a pop every ~16 kHz of scroll.
+  ledcAttach(PIN_LCD_BL, 300000, 8);  // Pin assignment, ~300kHz, 8-bit
   ledcWrite(PIN_LCD_BL, 0);          // Default value 0%
 
   // TFT display setup
