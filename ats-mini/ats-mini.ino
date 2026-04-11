@@ -983,6 +983,9 @@ void loop()
   // been no activity for a while
   prefsTickTime();
 
+  // Advance dim fade (no-op when not dimming)
+  dimTickTime();
+
   // Tick NETWORK time, connecting to WiFi if requested
   netTickTime();
 

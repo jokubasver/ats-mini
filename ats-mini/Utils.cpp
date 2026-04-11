@@ -17,6 +17,12 @@ static bool sleep_on = false;
 // Current dim status, returned by dimOn()
 static bool dim_on = false;
 
+// Dim fade state
+static uint32_t dimStartTime = 0;
+static uint16_t dimStartBrt  = 0;
+
+#define DIM_FADE_MS 3000  // Fade duration in ms
+
 // Current SSB patch status
 static bool ssbLoaded = false;
 
@@ -277,7 +283,8 @@ bool dimOn(int x)
   {
     // Only dim if not already sleeping (sleep turns off the backlight completely)
     dim_on = true;
-    ledcWrite(PIN_LCD_BL, 10);
+    dimStartTime = millis();
+    dimStartBrt  = currentBrt;
   }
   else if((x==0) && dim_on)
   {
@@ -286,6 +293,28 @@ bool dimOn(int x)
   }
 
   return(dim_on);
+}
+
+//
+// Advance the dim fade — call every main loop iteration while dimming.
+// Writes a linearly interpolated PWM value from dimStartBrt down to 10
+// over DIM_FADE_MS milliseconds.
+//
+void dimTickTime()
+{
+  if(!dim_on || sleep_on) return;
+
+  uint32_t elapsed = millis() - dimStartTime;
+  if(elapsed >= DIM_FADE_MS)
+  {
+    ledcWrite(PIN_LCD_BL, 10);
+  }
+  else
+  {
+    int brightness = (int)dimStartBrt - (int)((dimStartBrt - 10) * elapsed / DIM_FADE_MS);
+    if(brightness < 10) brightness = 10;
+    ledcWrite(PIN_LCD_BL, brightness);
+  }
 }
 
 //

@@ -24,6 +24,7 @@ int getStrength(int rssi);
 // Set, reset, toggle, or query switches
 bool sleepOn(int x = 2);
 bool dimOn(int x = 2);
+void dimTickTime();
 bool muteOn(uint8_t mode, int x = 2);
 
 // Wall clock functions
