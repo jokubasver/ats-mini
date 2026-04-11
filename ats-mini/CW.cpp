@@ -349,7 +349,12 @@ void cwInit(void)
   if(cwSampleSem == NULL) return;
 
   // Create the ADC sampler task at priority 2 (above the main loop at 1).
-  if(xTaskCreate(cwSamplerTaskFn, "cw_smpl", 2048, NULL, 2, &cwSamplerHandle) != pdPASS)
+  // Stack: 4096 bytes — analogRead() on ESP32-S3 calls through the IDF ADC
+  // oneshot driver which needs considerably more stack than 2048 bytes.
+  // Core: pinned to core 1, the same core as the Arduino loop task, so that
+  // the ADC driver is always accessed from the same core Arduino expects.
+  if(xTaskCreatePinnedToCore(cwSamplerTaskFn, "cw_smpl", 4096, NULL, 2,
+                              &cwSamplerHandle, 1) != pdPASS)
   {
     cwSamplerHandle = NULL;
     vSemaphoreDelete(cwSampleSem);
