@@ -299,13 +299,14 @@ bool dimOn(int x)
   {
     // Compute brightness at this exact moment so the wake fade starts from here
     uint32_t elapsed = millis() - dimStartTime;
-    int startBrt;
+    uint16_t startBrt;
     if(elapsed >= DIM_FADE_MS)
       startBrt = DIM_MIN_BRT;
     else
     {
-      startBrt = (int)dimStartBrt - (int)((dimStartBrt - DIM_MIN_BRT) * elapsed / DIM_FADE_MS);
-      if(startBrt < DIM_MIN_BRT) startBrt = DIM_MIN_BRT;
+      int brt = (int)dimStartBrt - (int)((uint32_t)(dimStartBrt - DIM_MIN_BRT) * elapsed / DIM_FADE_MS);
+      if(brt < DIM_MIN_BRT) brt = DIM_MIN_BRT;
+      startBrt = (uint16_t)brt;
     }
 
     dim_on = false;
@@ -338,7 +339,7 @@ void dimTickTime()
     }
     else
     {
-      int brightness = (int)wakeStartBrt + (int)((currentBrt - wakeStartBrt) * elapsed / WAKE_FADE_MS);
+      int brightness = (int)wakeStartBrt + (int)((uint32_t)(currentBrt - wakeStartBrt) * elapsed / WAKE_FADE_MS);
       if(brightness > currentBrt) brightness = currentBrt;
       ledcWrite(PIN_LCD_BL, brightness);
     }
@@ -356,7 +357,7 @@ void dimTickTime()
   {
     // Linear fade: starts at dimStartBrt (elapsed=0) and decreases to DIM_MIN_BRT (elapsed=DIM_FADE_MS).
     // uint32_t subtraction handles millis() rollover correctly.
-    int brightness = (int)dimStartBrt - (int)((dimStartBrt - DIM_MIN_BRT) * elapsed / DIM_FADE_MS);
+    int brightness = (int)dimStartBrt - (int)((uint32_t)(dimStartBrt - DIM_MIN_BRT) * elapsed / DIM_FADE_MS);
     if(brightness < DIM_MIN_BRT) brightness = DIM_MIN_BRT;
     ledcWrite(PIN_LCD_BL, brightness);
   }
