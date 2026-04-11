@@ -12,8 +12,7 @@
 #include <ESPAsyncWebServer.h>
 #include <NTPClient.h>
 #include <ESPmDNS.h>
-#include <esp_adc/adc_continuous.h>
-#include <freertos/semphr.h>
+#include <esp_timer.h>
 
 #define CONNECT_TIME  3000  // Time of inactivity to start connecting WiFi
 
@@ -22,20 +21,21 @@
 #define AUDIO_SAMPLE_RATE  8000  // 8 kHz sample rate
 #define AUDIO_CHUNK_SIZE   512   // Samples per WebSocket message (64 ms at 8 kHz)
 
-// GPIO11 on ESP32-S3 maps to ADC unit 2, channel 0.
-// Update these two defines if AUDIO_PIN ever changes.
-#define AUDIO_ADC_UNIT    ADC_UNIT_2    // ADC2 owns GPIO11-GPIO20 on ESP32-S3
-#define AUDIO_ADC_CHANNEL ADC_CHANNEL_0 // GPIO11 = ADC2_CH0
-static_assert(AUDIO_PIN == 11, "AUDIO_PIN changed: update AUDIO_ADC_UNIT and AUDIO_ADC_CHANNEL");
+// GPIO11 on ESP32-S3: ADC2 channel 0.  We use analogRead (oneshot driver) rather
+// than the ADC continuous DMA driver because the continuous driver bypasses the
+// ADC2/WiFi arbitration layer and causes an immediate panic on ESP32-S3 when WiFi
+// is active.  analogRead handles the coexistence lock internally.
 
-static uint8_t                 audioChunk[2][AUDIO_CHUNK_SIZE]; // double buffer
-static volatile int            audioChunkIdx = 0;               // active write buffer
-static volatile int            audioChunkPos = 0;
-static adc_continuous_handle_t adcHandle     = nullptr;
-static volatile int32_t        audioDcEst    = 128 << 8;        // Q8 DC estimate for IIR HP filter
-static AsyncWebSocket          audioWS("/audiows");
-static QueueHandle_t           audioSendQ    = nullptr;         // completed chunk indices → send task
-static TaskHandle_t            audioSendH    = nullptr;
+static uint8_t             audioChunk[2][AUDIO_CHUNK_SIZE]; // double buffer
+static volatile int        audioChunkIdx = 0;               // active write buffer
+static volatile int        audioChunkPos = 0;
+static esp_timer_handle_t  audioTimer    = nullptr;
+static TaskHandle_t        audioSampleH  = nullptr;
+static volatile int32_t    audioDcEst    = 128 << 8;        // Q8 DC estimate for IIR HP filter
+static volatile bool       audioRunning  = false;
+static AsyncWebSocket      audioWS("/audiows");
+static QueueHandle_t       audioSendQ    = nullptr;         // completed chunk indices → send task
+static TaskHandle_t        audioSendH    = nullptr;
 
 WiFiMulti wifiMulti;
 
@@ -344,31 +344,29 @@ static void audioSendTask(void *)
 }
 
 //
-// ADC continuous-mode DMA callback – runs in ISR context once per DMA frame
-// (AUDIO_CHUNK_SIZE samples = 64 ms at 8 kHz, ~16 wakeups/sec).
-// Hardware DMA clocks samples at exactly AUDIO_SAMPLE_RATE Hz with zero
-// per-sample jitter, which is far better than the ~10–50 µs jitter of the
-// former esp_timer approach.
+// esp_timer callback – fires at AUDIO_SAMPLE_RATE Hz from the esp_timer task.
+// Sends a task notification to audioSampleTask so the actual ADC read happens
+// in a regular task context (required because analogRead uses a mutex internally
+// to arbitrate ADC2 access with the WiFi driver).
 //
-// Each raw 12-bit result is shifted to 8-bit, passed through the IIR
-// DC-blocking filter, and written into the double-buffer.  When a chunk fills,
-// the index is queued to the send task (non-blocking; drops if lagging).
-//
-static bool IRAM_ATTR adcConvDoneCB(adc_continuous_handle_t handle,
-                                    const adc_continuous_evt_data_t *edata,
-                                    void *user_data)
+static void audioTimerCB(void *)
 {
-  BaseType_t mustYield = pdFALSE;
-  const adc_digi_output_data_t *p =
-    reinterpret_cast<const adc_digi_output_data_t *>(edata->conv_frame_buffer);
-  uint32_t count = edata->size / sizeof(adc_digi_output_data_t);
+  if(audioSampleH)
+    vTaskNotifyGive(audioSampleH);
+}
 
-  for(uint32_t i = 0; i < count; i++)
+//
+// Sampling task – woken by audioTimerCB at 8 kHz.
+// Calls analogRead, applies the IIR DC-blocking filter, and fills the double-
+// buffer.  When a chunk is full it queues the index to audioSendTask.
+//
+static void audioSampleTask(void *)
+{
+  analogSetPinAttenuation(AUDIO_PIN, ADC_ATTEN_DB_12);  // 0–3.3 V range
+
+  while(ulTaskNotifyTake(pdTRUE, portMAX_DELAY) && audioRunning)
   {
-    // Skip results from an unexpected channel.
-    if(p[i].type2.channel != AUDIO_ADC_CHANNEL) continue;
-
-    uint8_t raw = (uint8_t)(p[i].type2.data >> 4);  // 12-bit → 8-bit unsigned
+    uint8_t raw = (uint8_t)(analogRead(AUDIO_PIN) >> 4);  // 12-bit → 8-bit unsigned
 
     // IIR DC-blocking high-pass (Q8 fixed-point, α = 255/256, cutoff ≈ 5 Hz).
     audioDcEst += (int32_t)raw - (audioDcEst >> 8);
@@ -379,66 +377,57 @@ static bool IRAM_ATTR adcConvDoneCB(adc_continuous_handle_t handle,
     audioChunk[audioChunkIdx][audioChunkPos++] = (uint8_t)s;
     if(audioChunkPos >= AUDIO_CHUNK_SIZE)
     {
-      int sendIdx   = audioChunkIdx;
-      audioChunkIdx ^= 1;  // swap to the other buffer before handing off
+      int sendIdx    = audioChunkIdx;
+      audioChunkIdx ^= 1;
       audioChunkPos  = 0;
-      // Non-blocking: drop the chunk rather than stalling if the send task lags.
-      xQueueSendFromISR(audioSendQ, &sendIdx, &mustYield);
+      xQueueSend(audioSendQ, &sendIdx, 0);
     }
   }
 
-  return mustYield == pdTRUE;
+  audioSampleH = nullptr;
+  vTaskDelete(nullptr);
 }
 
 static void startAudioSampling()
 {
-  if(adcHandle) return;
+  if(audioTimer) return;
   audioChunkIdx = 0;
   audioChunkPos = 0;
-  audioDcEst    = 128 << 8;  // reset DC estimate for a clean start
+  audioDcEst    = 128 << 8;
+  audioRunning  = true;
 
   // Depth 2: one chunk queued for the send task while the next is filling.
   audioSendQ = xQueueCreate(2, sizeof(int));
 
   // Send task: priority 2 (above loop) so display-loop SPI activity cannot
   // delay chunk delivery to the WebSocket client.
-  xTaskCreatePinnedToCore(audioSendTask, "audioSend", 4096, nullptr, 2, &audioSendH, 1);
+  xTaskCreatePinnedToCore(audioSendTask, "audioSend", 8192, nullptr, 2, &audioSendH, 1);
 
-  // DMA ring-buffer holds 2 conversion frames so the ISR callback is never
-  // starved even if it is delayed by one frame interval (64 ms).
-  adc_continuous_handle_cfg_t cfg = {};
-  cfg.max_store_buf_size = 2 * AUDIO_CHUNK_SIZE * sizeof(adc_digi_output_data_t);
-  cfg.conv_frame_size    =     AUDIO_CHUNK_SIZE * sizeof(adc_digi_output_data_t);
-  adc_continuous_new_handle(&cfg, &adcHandle);
+  // Sampling task: priority 3 so it preempts the send task and the main loop.
+  // Pinned to core 0 to keep the WiFi/TCP stack on core 1 unimpeded.
+  xTaskCreatePinnedToCore(audioSampleTask, "audioSample", 4096, nullptr, 3, &audioSampleH, 0);
 
-  // One pattern: ADC2 channel 0 (GPIO11), 12-bit, 12 dB attenuation (0–3.3 V).
-  adc_digi_pattern_config_t pattern = {};
-  pattern.atten     = ADC_ATTEN_DB_12;
-  pattern.channel   = AUDIO_ADC_CHANNEL;
-  pattern.unit      = AUDIO_ADC_UNIT;
-  pattern.bit_width = ADC_BITWIDTH_12;
-
-  adc_continuous_config_t digCfg = {};
-  digCfg.sample_freq_hz = AUDIO_SAMPLE_RATE;
-  digCfg.conv_mode      = ADC_CONV_SINGLE_UNIT_2;  // only ADC2 channels
-  digCfg.format         = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
-  digCfg.pattern_num    = 1;
-  digCfg.adc_pattern    = &pattern;
-  adc_continuous_config(adcHandle, &digCfg);
-
-  adc_continuous_evt_cbs_t cbs = {};
-  cbs.on_conv_done = adcConvDoneCB;
-  adc_continuous_register_event_callbacks(adcHandle, &cbs, nullptr);
-
-  adc_continuous_start(adcHandle);
+  // Periodic timer at exactly AUDIO_SAMPLE_RATE Hz to trigger each ADC read.
+  esp_timer_create_args_t timerArgs = {};
+  timerArgs.callback = audioTimerCB;
+  timerArgs.name     = "audioSample";
+  esp_timer_create(&timerArgs, &audioTimer);
+  esp_timer_start_periodic(audioTimer, 1000000ULL / AUDIO_SAMPLE_RATE);
 }
 
 static void stopAudioSampling()
 {
-  if(!adcHandle) return;
-  adc_continuous_stop(adcHandle);
-  adc_continuous_deinit(adcHandle);
-  adcHandle = nullptr;
+  if(!audioTimer) return;
+
+  // Stop the timer first so no new notifications arrive after we clear the flag.
+  audioRunning = false;
+  esp_timer_stop(audioTimer);
+  esp_timer_delete(audioTimer);
+  audioTimer = nullptr;
+
+  // Wake the sampling task one last time so it can see audioRunning == false.
+  if(audioSampleH) vTaskNotifyGive(audioSampleH);
+  for(int i = 0; i < 200 && audioSampleH; i++) vTaskDelay(1);
 
   // Send a poison pill to wake and stop the send task.
   if(audioSendQ)
