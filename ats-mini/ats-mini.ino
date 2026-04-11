@@ -204,7 +204,7 @@ void setup()
 
   // Check for SI4732 connected on I2C interface
   // If the SI4732 is not detected, then halt with no further processing
-  rx.setI2CFastModeCustom(800000UL);
+  rx.setI2CFastModeCustom(1000000UL);
 
   // Looks for the I2C bus address and set it.  Returns 0 if error
   int16_t si4735Addr = rx.getDeviceI2CAddress(RESET_PIN);
@@ -758,7 +758,9 @@ void loop()
   serialTickTime(&Serial, &remoteSerialState, usbModeIdx);
   remoteBLETickTime(&BLESerial, &remoteBLEState, bleModeIdx);
 
-  // if(encCount && getCpuFrequencyMhz()!=240) setCpuFrequencyMhz(240);
+  // Boost CPU to 240 MHz on any user activity for snappier tuning and rendering
+  if((encCount || pb1st.wasClicked || pb1st.wasShortPressed || pb1st.isLongPressed) && getCpuFrequencyMhz()!=240)
+    setCpuFrequencyMhz(240);
 
   // Receive and execute serial command
   int ser_event = serialDoCommand(&Serial, &remoteSerialState, usbModeIdx);
@@ -930,7 +932,8 @@ void loop()
   // Disable commands control
   if((currentTime - elapsedCommand) > ELAPSED_COMMAND)
   {
-    // if(getCpuFrequencyMhz()!=80) setCpuFrequencyMhz(80);
+    // Drop CPU back to 80 MHz when idle to save power
+    if(getCpuFrequencyMhz()!=80) setCpuFrequencyMhz(80);
     if(currentCmd != CMD_NONE && currentCmd != CMD_SEEK && currentCmd != CMD_SCAN && currentCmd != CMD_MEMORY)
     {
       currentCmd = CMD_NONE;
