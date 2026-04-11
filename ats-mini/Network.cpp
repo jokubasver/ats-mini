@@ -411,12 +411,12 @@ static void startAudioSampling()
   cfg.conv_frame_size    =     AUDIO_CHUNK_SIZE * sizeof(adc_digi_output_data_t);
   adc_continuous_new_handle(&cfg, &adcHandle);
 
-  // One pattern: ADC2 channel 0 (GPIO11), 12-bit, 11 dB attenuation (0–3.3 V).
+  // One pattern: ADC2 channel 0 (GPIO11), 12-bit, 12 dB attenuation (0–3.3 V).
   adc_digi_pattern_config_t pattern = {};
   pattern.atten     = ADC_ATTEN_DB_12;
   pattern.channel   = AUDIO_ADC_CHANNEL;
   pattern.unit      = AUDIO_ADC_UNIT;
-  pattern.bit_width = 12;
+  pattern.bit_width = ADC_BITWIDTH_12;
 
   adc_continuous_config_t digCfg = {};
   digCfg.sample_freq_hz = AUDIO_SAMPLE_RATE;
