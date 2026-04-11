@@ -206,15 +206,22 @@ static esp_timer_handle_t cwSampleTimer   = NULL;
 static TaskHandle_t       cwSamplerHandle = NULL;
 static SemaphoreHandle_t  cwSampleSem     = NULL;
 
-// Timer callback: runs in the esp_timer service task (high-priority FreeRTOS
-// task).  Signals the sampler task via a binary semaphore — does NOT call
-// analogRead() here.  Calling analogRead() from a high-priority task can
-// cause priority inversion if the Arduino ADC mutex is held by a lower-
-// priority task (e.g. battery monitor), which would starve the main loop
-// and freeze both the UI and the CW decoder.
-static void cwTimerCallback(void * /*arg*/)
+// Timer callback: runs directly in the hardware timer ISR (ESP_TIMER_ISR
+// dispatch).  This avoids waking the esp_timer service task (FreeRTOS
+// priority 22) on every tick.  With ESP_TIMER_TASK dispatch at 4 kHz the
+// service task was being woken 4000×/s on core 0, competing with the
+// WiFi/BLE controller tasks at comparable priorities and starving them long
+// enough to trigger their internal watchdog (~500 ms timeout) — the root
+// cause of the boot loop.
+//
+// The ISR itself is < 2 µs; it simply signals the lower-priority sampler
+// task which then calls analogRead() safely in task context.
+static void IRAM_ATTR cwTimerCallback(void * /*arg*/)
 {
-  if(cwSampleSem) xSemaphoreGive(cwSampleSem);
+  if(!cwSampleSem) return;
+  BaseType_t woken = pdFALSE;
+  xSemaphoreGiveFromISR(cwSampleSem, &woken);
+  if(woken) portYIELD_FROM_ISR();
 }
 
 // Sampler task (priority 2 — just above the main Arduino loop at priority 1).
@@ -363,11 +370,14 @@ void cwInit(void)
   }
 
   // Create and start the 4 kHz periodic timer that wakes the sampler task.
+  // ESP_TIMER_ISR dispatch: the callback runs directly from the hardware
+  // timer ISR (not via the esp_timer service task) so it completes in ~2 µs
+  // and never involves the priority-22 esp_timer FreeRTOS task.
   const esp_timer_create_args_t timerArgs =
   {
     .callback              = cwTimerCallback,
     .arg                   = NULL,
-    .dispatch_method       = ESP_TIMER_TASK,
+    .dispatch_method       = ESP_TIMER_ISR,
     .name                  = "cw_sample",
     .skip_unhandled_events = true,
   };
