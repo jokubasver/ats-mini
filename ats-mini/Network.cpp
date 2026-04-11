@@ -12,8 +12,6 @@
 #include <ESPAsyncWebServer.h>
 #include <NTPClient.h>
 #include <ESPmDNS.h>
-#include <esp_timer.h>
-#include <freertos/semphr.h>
 
 #define CONNECT_TIME  3000  // Time of inactivity to start connecting WiFi
 
@@ -21,18 +19,19 @@
 #define AUDIO_PIN          11    // GPIO11 – ADC input from NS4160 pin 8 via RC filter
 #define AUDIO_SAMPLE_RATE  8000  // 8 kHz sample rate
 #define AUDIO_CHUNK_SIZE   512   // Samples per WebSocket message (64 ms at 8 kHz)
-#define AUDIO_BATCH        16    // Output samples collected per timer tick; timer fires at
-                                 // AUDIO_SAMPLE_RATE/AUDIO_BATCH Hz (500 Hz) instead of
-                                 // AUDIO_SAMPLE_RATE Hz (8000 Hz), cutting context switches
-                                 // on core 1 by 16× and keeping the display responsive.
+// AUDIO_BATCH: ADC reads per task wakeup.  Must satisfy:
+//   (AUDIO_BATCH * 1000) % AUDIO_SAMPLE_RATE == 0  (integer ms period)
+// 16 samples × 1 read each ≈ 1.2 ms → period = 2 ms (configTICK_RATE_HZ=1000).
+#define AUDIO_BATCH        16
 
 static uint8_t            audioChunk[2][AUDIO_CHUNK_SIZE]; // double buffer
 static volatile int       audioChunkIdx = 0;               // active write buffer
 static volatile int       audioChunkPos = 0;
-static esp_timer_handle_t audioTimer    = nullptr;
+static volatile bool      audioRunning  = false;           // run flag shared between tasks
 static AsyncWebSocket     audioWS("/audiows");
-static SemaphoreHandle_t  audioSem      = nullptr;
+static QueueHandle_t      audioSendQ    = nullptr;         // completed chunk indices → send task
 static TaskHandle_t       audioTaskH    = nullptr;
+static TaskHandle_t       audioSendH    = nullptr;
 
 WiFiMulti wifiMulti;
 
@@ -322,44 +321,54 @@ static bool wifiConnect()
 }
 
 //
-// Audio timer callback – fires at AUDIO_SAMPLE_RATE/AUDIO_BATCH Hz (500 Hz).
-// Uses ESP_TIMER_TASK dispatch (the only option available in arduino core
-// 3.3.7 / ESP-IDF 5.1).  The callback runs in a task context, not an ISR,
-// so the regular (non-ISR) semaphore API must be used.  It does no heavy
-// work: it just wakes the audio task on core 1 via a binary semaphore so
-// that all ADC reads and WebSocket sends happen there, away from the WiFi
-// stack which runs on core 0.
+// Audio send task – runs on core 1 at FreeRTOS priority 0 (below loop/sampler).
+// Receives completed buffer indices through a queue and calls binaryAll() only
+// after the sampler has already moved to the other buffer.  Keeping I/O here
+// prevents any TCP-stack stall from pausing ADC collection and causing ticks.
 //
-static void audioTimerCB(void *)
+static void audioSendTask(void *)
 {
-  if(audioSem) xSemaphoreGive(audioSem);
+  int idx;
+  while(xQueueReceive(audioSendQ, &idx, portMAX_DELAY) == pdTRUE)
+  {
+    if(idx < 0) break;  // poison pill – stop signal
+    if(audioWS.count() > 0)
+      audioWS.binaryAll(audioChunk[idx], AUDIO_CHUNK_SIZE);
+  }
+  audioSendH = nullptr;
+  vTaskDelete(nullptr);
 }
 
 //
-// Audio sampling task – runs on core 1 (Arduino's core, away from WiFi).
-// Wakes on each semaphore give (AUDIO_SAMPLE_RATE/AUDIO_BATCH times per
-// second), then collects AUDIO_BATCH output samples per wakeup.  Each
-// output sample is the average of two consecutive ADC reads (2× oversampling)
-// to reduce ADC noise without extra bandwidth.
+// Audio sampling task – runs on core 1 at priority 1 (same as loop).
+// Uses vTaskDelayUntil for accurate periodic wakeup without a hardware timer
+// or semaphore; the FreeRTOS scheduler guarantees the period even if one
+// wakeup runs long, so ticks are never dropped and the sample rate stays
+// stable (no pitch shift, no drop-outs).  Each wakeup reads AUDIO_BATCH
+// ADC samples then signals the lower-priority send task via a queue when a
+// full chunk is ready.
 //
 static void audioTask(void *)
 {
-  while(xSemaphoreTake(audioSem, portMAX_DELAY) == pdTRUE)
+  // Period in FreeRTOS ticks: AUDIO_BATCH samples at AUDIO_SAMPLE_RATE Hz.
+  // 16 * 1000 / 8000 = 2 ms = 2 ticks at configTICK_RATE_HZ = 1000.
+  const TickType_t period = pdMS_TO_TICKS(1000UL * AUDIO_BATCH / AUDIO_SAMPLE_RATE);
+  TickType_t lastWake = xTaskGetTickCount();
+
+  while(audioRunning)
   {
-    if(!audioTimer) break;  // stop signal
+    vTaskDelayUntil(&lastWake, period);
     for(int i = 0; i < AUDIO_BATCH; i++)
     {
-      // 2× oversampling: average two consecutive 12-bit reads, then scale to 8-bit.
-      // sum of two 12-bit reads (0–8190) >> 5 == (sum/2) >> 4 → 8-bit unsigned PCM.
-      uint32_t raw = (uint32_t)analogRead(AUDIO_PIN) + analogRead(AUDIO_PIN);
-      audioChunk[audioChunkIdx][audioChunkPos++] = (uint8_t)(raw >> 5);
+      audioChunk[audioChunkIdx][audioChunkPos++] = (uint8_t)(analogRead(AUDIO_PIN) >> 4);
       if(audioChunkPos >= AUDIO_CHUNK_SIZE)
       {
         int sendIdx   = audioChunkIdx;
-        audioChunkIdx ^= 1;  // swap to other buffer before sending
+        audioChunkIdx ^= 1;  // swap to other buffer before handing off
         audioChunkPos  = 0;
-        if(audioWS.count() > 0)
-          audioWS.binaryAll(audioChunk[sendIdx], AUDIO_CHUNK_SIZE);
+        // Non-blocking send: if the queue is full (send task lagging) the chunk
+        // is intentionally dropped rather than stalling the sampler.
+        xQueueSend(audioSendQ, &sendIdx, 0);
       }
     }
   }
@@ -369,43 +378,39 @@ static void audioTask(void *)
 
 static void startAudioSampling()
 {
-  if(audioTimer) return;
+  if(audioRunning) return;
   analogSetPinAttenuation(AUDIO_PIN, ADC_11db);
   audioChunkIdx = 0;
   audioChunkPos = 0;
+  audioRunning  = true;
 
-  audioSem = xSemaphoreCreateBinary();
+  // Depth 2: one chunk queued for the send task while the next is filling.
+  audioSendQ = xQueueCreate(2, sizeof(int));
 
-  // Pin audio task to core 1 (Arduino loop core) so it doesn't compete
-  // with the WiFi stack which runs on core 0.  Priority 1 (same as loop)
-  // lets it timeslice with the display rather than preempting it.  Stack
-  // must be large enough for analogRead()'s deep HAL chain plus binaryAll().
+  // Send task: lower priority (0) so WebSocket I/O never blocks ADC reads.
+  xTaskCreatePinnedToCore(audioSendTask, "audioSend", 4096, nullptr, 0, &audioSendH, 1);
+
+  // Sampler: priority 1 (same as loop), pinned to core 1, away from WiFi.
   xTaskCreatePinnedToCore(audioTask, "audioADC", 8192, nullptr, 1, &audioTaskH, 1);
-
-  esp_timer_create_args_t args = {};
-  args.callback              = audioTimerCB;
-  args.dispatch_method       = ESP_TIMER_TASK;  // only dispatch method in ESP-IDF 5.1
-  args.name                  = "audioADC";
-  args.skip_unhandled_events = true;
-  esp_timer_create(&args, &audioTimer);
-  // Fire at AUDIO_SAMPLE_RATE/AUDIO_BATCH Hz so the task wakes in bursts
-  // rather than once per sample, cutting context switches 16×.
-  esp_timer_start_periodic(audioTimer, 1000000ULL * AUDIO_BATCH / AUDIO_SAMPLE_RATE);
 }
 
 static void stopAudioSampling()
 {
-  if(!audioTimer) return;
-  esp_timer_stop(audioTimer);
-  esp_timer_delete(audioTimer);
-  audioTimer    = nullptr;
+  if(!audioRunning) return;
+  audioRunning = false;
 
-  // Wake the task so it can observe audioTimer == nullptr and exit.
-  // Wait up to 200 ms (200 × 1 ms delay) for the task to self-delete.
-  if(audioSem) xSemaphoreGive(audioSem);
-  for(int i = 0; i < 200 && audioTaskH; i++) vTaskDelay(1);
+  // Wait up to 10 ms for the sampler to finish its current sleep and exit.
+  for(int i = 0; i < 10 && audioTaskH; i++) vTaskDelay(1);
 
-  if(audioSem) { vSemaphoreDelete(audioSem); audioSem = nullptr; }
+  // Send a poison pill to wake and stop the send task.
+  if(audioSendQ)
+  {
+    int stop = -1;
+    xQueueSend(audioSendQ, &stop, pdMS_TO_TICKS(100));
+  }
+  for(int i = 0; i < 200 && audioSendH; i++) vTaskDelay(1);
+
+  if(audioSendQ) { vQueueDelete(audioSendQ); audioSendQ = nullptr; }
   audioChunkIdx = 0;
   audioChunkPos = 0;
 }
