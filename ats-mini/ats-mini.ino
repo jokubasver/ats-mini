@@ -754,12 +754,15 @@ void loop()
 
   ButtonTracker::State pb1st = pb1.update(digitalRead(ENCODER_PUSH_BUTTON) == LOW);
 
+  // Detect any user activity (encoder rotation or button event)
+  bool userIsActive = encCount || pb1st.wasClicked || pb1st.wasShortPressed || pb1st.isLongPressed;
+
   // Periodically print status to remote interfaces
   serialTickTime(&Serial, &remoteSerialState, usbModeIdx);
   remoteBLETickTime(&BLESerial, &remoteBLEState, bleModeIdx);
 
   // Boost CPU to 240 MHz on any user activity for snappier tuning and rendering
-  if((encCount || pb1st.wasClicked || pb1st.wasShortPressed || pb1st.isLongPressed) && getCpuFrequencyMhz()!=240)
+  if(userIsActive && getCpuFrequencyMhz()!=240)
     setCpuFrequencyMhz(240);
 
   // Receive and execute serial command
@@ -784,7 +787,7 @@ void loop()
   if(encCount && sleepOn() && sleepModeIdx==SLEEP_LOCKED) encCount = encCountAccel = 0;
 
   // Wake display from dim if any user interaction is detected
-  if(dimOn() && (encCount || pb1st.wasClicked || pb1st.wasShortPressed || pb1st.isLongPressed))
+  if(dimOn() && userIsActive)
     dimOn(false);
 
   // Activate push and rotate mode (can span multiple loop iterations until the button is released)

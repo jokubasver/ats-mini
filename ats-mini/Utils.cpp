@@ -21,7 +21,8 @@ static bool dim_on = false;
 static uint32_t dimStartTime = 0;
 static uint16_t dimStartBrt  = 0;
 
-#define DIM_FADE_MS 3000  // Fade duration in ms
+#define DIM_FADE_MS  3000  // Fade duration in ms
+#define DIM_MIN_BRT  10    // Minimum brightness after dim
 
 // Current SSB patch status
 static bool ssbLoaded = false;
@@ -307,14 +308,14 @@ void dimTickTime()
   uint32_t elapsed = millis() - dimStartTime;
   if(elapsed >= DIM_FADE_MS)
   {
-    ledcWrite(PIN_LCD_BL, 10);
+    ledcWrite(PIN_LCD_BL, DIM_MIN_BRT);
   }
   else
   {
-    // Linear fade: starts at dimStartBrt (elapsed=0) and decreases to 10 (elapsed=DIM_FADE_MS).
+    // Linear fade: starts at dimStartBrt (elapsed=0) and decreases to DIM_MIN_BRT (elapsed=DIM_FADE_MS).
     // uint32_t subtraction handles millis() rollover correctly.
-    int brightness = (int)dimStartBrt - (int)((dimStartBrt - 10) * elapsed / DIM_FADE_MS);
-    if(brightness < 10) brightness = 10;
+    int brightness = (int)dimStartBrt - (int)((dimStartBrt - DIM_MIN_BRT) * elapsed / DIM_FADE_MS);
+    if(brightness < DIM_MIN_BRT) brightness = DIM_MIN_BRT;
     ledcWrite(PIN_LCD_BL, brightness);
   }
 }
