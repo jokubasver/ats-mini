@@ -13,19 +13,22 @@
 #include <NTPClient.h>
 #include <ESPmDNS.h>
 #include <esp_timer.h>
+#include <freertos/semphr.h>
 
 #define CONNECT_TIME  3000  // Time of inactivity to start connecting WiFi
 
 // Audio streaming via WebSocket
 #define AUDIO_PIN          11    // GPIO11 – ADC input from NS4160 pin 8 via RC filter
 #define AUDIO_SAMPLE_RATE  8000  // 8 kHz sample rate
-#define AUDIO_CHUNK_SIZE   256   // Samples per WebSocket message (32 ms)
+#define AUDIO_CHUNK_SIZE   512   // Samples per WebSocket message (64 ms at 8 kHz)
 
 static uint8_t            audioChunk[2][AUDIO_CHUNK_SIZE]; // double buffer
 static volatile int       audioChunkIdx = 0;               // active write buffer
 static volatile int       audioChunkPos = 0;
 static esp_timer_handle_t audioTimer    = nullptr;
 static AsyncWebSocket     audioWS("/audiows");
+static SemaphoreHandle_t  audioSem      = nullptr;
+static TaskHandle_t       audioTaskH    = nullptr;
 
 WiFiMulti wifiMulti;
 
@@ -91,6 +94,9 @@ void netTickTime()
     connectTime = millis();
     itIsTimeToWiFi = false;
   }
+
+  // Periodically clean up stale WebSocket connections
+  audioWS.cleanupClients();
 }
 
 //
@@ -312,20 +318,42 @@ static bool wifiConnect()
 }
 
 //
-// Audio ADC sampling callback – runs at AUDIO_SAMPLE_RATE Hz
+// Audio timer ISR – fires at AUDIO_SAMPLE_RATE Hz on core 0 but does no work:
+// it just wakes the audio task on core 1 via a binary semaphore.
 //
-static void audioSampleCB(void *)
+static void IRAM_ATTR audioTimerCB(void *)
 {
-  uint16_t raw = analogRead(AUDIO_PIN);
-  audioChunk[audioChunkIdx][audioChunkPos++] = (uint8_t)(raw >> 4);
-  if(audioChunkPos >= AUDIO_CHUNK_SIZE)
+  if(audioSem)
   {
-    int sendIdx   = audioChunkIdx;
-    audioChunkIdx ^= 1;  // swap to other buffer before sending
-    audioChunkPos  = 0;
-    if(audioWS.count() > 0)
-      audioWS.binaryAll(audioChunk[sendIdx], AUDIO_CHUNK_SIZE);
+    BaseType_t hp = pdFALSE;
+    xSemaphoreGiveFromISR(audioSem, &hp);
+    if(hp) portYIELD_FROM_ISR();
   }
+}
+
+//
+// Audio sampling task – runs on core 1 (Arduino's core, away from WiFi).
+// Wakes on each semaphore give, reads ADC, fills the double buffer, and
+// sends completed chunks via WebSocket.
+//
+static void audioTask(void *)
+{
+  while(xSemaphoreTake(audioSem, portMAX_DELAY) == pdTRUE)
+  {
+    if(!audioTimer) break;  // stop signal
+    uint16_t raw = analogRead(AUDIO_PIN);
+    audioChunk[audioChunkIdx][audioChunkPos++] = (uint8_t)(raw >> 4);
+    if(audioChunkPos >= AUDIO_CHUNK_SIZE)
+    {
+      int sendIdx   = audioChunkIdx;
+      audioChunkIdx ^= 1;  // swap to other buffer before sending
+      audioChunkPos  = 0;
+      if(audioWS.count() > 0)
+        audioWS.binaryAll(audioChunk[sendIdx], AUDIO_CHUNK_SIZE);
+    }
+  }
+  audioTaskH = nullptr;
+  vTaskDelete(nullptr);
 }
 
 static void startAudioSampling()
@@ -334,9 +362,16 @@ static void startAudioSampling()
   analogSetPinAttenuation(AUDIO_PIN, ADC_11db);
   audioChunkIdx = 0;
   audioChunkPos = 0;
+
+  audioSem = xSemaphoreCreateBinary();
+
+  // Pin audio task to core 1 (Arduino loop core) so it doesn't compete
+  // with the WiFi stack which runs on core 0.
+  xTaskCreatePinnedToCore(audioTask, "audioADC", 2048, nullptr, 2, &audioTaskH, 1);
+
   esp_timer_create_args_t args = {};
-  args.callback              = audioSampleCB;
-  args.dispatch_method       = ESP_TIMER_TASK;
+  args.callback              = audioTimerCB;
+  args.dispatch_method       = ESP_TIMER_ISR;  // very brief ISR on core 0
   args.name                  = "audioADC";
   args.skip_unhandled_events = true;
   esp_timer_create(&args, &audioTimer);
@@ -349,6 +384,13 @@ static void stopAudioSampling()
   esp_timer_stop(audioTimer);
   esp_timer_delete(audioTimer);
   audioTimer    = nullptr;
+
+  // Wake the task so it can observe audioTimer == nullptr and exit.
+  // Wait up to 200 ms (200 × 1 ms delay) for the task to self-delete.
+  if(audioSem) xSemaphoreGive(audioSem);
+  for(int i = 0; i < 200 && audioTaskH; i++) vTaskDelay(1);
+
+  if(audioSem) { vSemaphoreDelete(audioSem); audioSem = nullptr; }
   audioChunkIdx = 0;
   audioChunkPos = 0;
 }
@@ -611,29 +653,40 @@ static const String webAudioPage()
 "<TR><TD CLASS='CENTER' ID='st'>Press Start to listen</TD></TR>"
 "</TABLE>"
 "<SCRIPT>"
-"var ctx=null,ws=null,npt=0;"
+"var ctx=null,ws=null,npt=0,JITTER=0.3;"
 "function startAudio(){"
   "if(ws)return;"
-  "ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:8000});"
+  "if(!ctx||ctx.state==='closed')ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:8000});"
+  "ctx.resume();"
   "ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/audiows');"
   "ws.binaryType='arraybuffer';"
-  "ws.onopen=function(){document.getElementById('st').textContent='Streaming...';};"
+  "ws.onopen=function(){"
+    "if(ctx&&ctx.state==='suspended')ctx.resume();"
+    "npt=0;"
+    "document.getElementById('st').textContent='Streaming...';"
+  "};"
   "ws.onmessage=function(e){"
+    "if(!ctx||ctx.state==='closed')return;"
     "var b=new Uint8Array(e.data);"
     "var a=ctx.createBuffer(1,b.length,8000);"
     "var d=a.getChannelData(0);"
     "for(var i=0;i<b.length;i++)d[i]=b[i]/128.0-1.0;"
     "var s=ctx.createBufferSource();"
     "s.buffer=a;s.connect(ctx.destination);"
-    "var n=ctx.currentTime;if(npt<n)npt=n+0.05;"
+    "var n=ctx.currentTime;if(npt<n)npt=n+JITTER;"
     "s.start(npt);npt+=b.length/8000;"
   "};"
-  "ws.onclose=function(){stopAudio();};"
+  "ws.onclose=function(){"
+    "ws=null;npt=0;"
+    "document.getElementById('sta').disabled=false;"
+    "document.getElementById('sto').disabled=true;"
+    "document.getElementById('st').textContent='Disconnected - click Start to retry';"
+  "};"
   "document.getElementById('sta').disabled=true;"
   "document.getElementById('sto').disabled=false;"
 "}"
 "function stopAudio(){"
-  "if(ws){ws.close();ws=null;}"
+  "if(ws){ws.onclose=null;ws.close();ws=null;}"
   "if(ctx){ctx.close();ctx=null;}"
   "npt=0;"
   "document.getElementById('sta').disabled=false;"
