@@ -12,7 +12,7 @@
 #include <ESPAsyncWebServer.h>
 #include <NTPClient.h>
 #include <ESPmDNS.h>
-#include <esp_timer.h>
+#include <esp_adc/adc_continuous.h>
 #include <freertos/semphr.h>
 
 #define CONNECT_TIME  3000  // Time of inactivity to start connecting WiFi
@@ -22,15 +22,20 @@
 #define AUDIO_SAMPLE_RATE  8000  // 8 kHz sample rate
 #define AUDIO_CHUNK_SIZE   512   // Samples per WebSocket message (64 ms at 8 kHz)
 
-static uint8_t            audioChunk[2][AUDIO_CHUNK_SIZE]; // double buffer
-static volatile int       audioChunkIdx = 0;               // active write buffer
-static volatile int       audioChunkPos = 0;
-static esp_timer_handle_t audioTimer    = nullptr;
-static int32_t            audioDcEst    = 128 << 8;        // Q8 DC estimate for IIR HP filter
-static AsyncWebSocket     audioWS("/audiows");
-static QueueHandle_t      audioSendQ    = nullptr;         // completed chunk indices → send task
-static TaskHandle_t       audioTaskH    = nullptr;
-static TaskHandle_t       audioSendH    = nullptr;
+// GPIO11 on ESP32-S3 maps to ADC unit 2, channel 0.
+// Update these two defines if AUDIO_PIN ever changes.
+#define AUDIO_ADC_UNIT    ADC_UNIT_2    // ADC2 owns GPIO11-GPIO20 on ESP32-S3
+#define AUDIO_ADC_CHANNEL ADC_CHANNEL_0 // GPIO11 = ADC2_CH0
+static_assert(AUDIO_PIN == 11, "AUDIO_PIN changed: update AUDIO_ADC_UNIT and AUDIO_ADC_CHANNEL");
+
+static uint8_t                 audioChunk[2][AUDIO_CHUNK_SIZE]; // double buffer
+static volatile int            audioChunkIdx = 0;               // active write buffer
+static volatile int            audioChunkPos = 0;
+static adc_continuous_handle_t adcHandle     = nullptr;
+static volatile int32_t        audioDcEst    = 128 << 8;        // Q8 DC estimate for IIR HP filter
+static AsyncWebSocket          audioWS("/audiows");
+static QueueHandle_t           audioSendQ    = nullptr;         // completed chunk indices → send task
+static TaskHandle_t            audioSendH    = nullptr;
 
 WiFiMulti wifiMulti;
 
@@ -339,40 +344,31 @@ static void audioSendTask(void *)
 }
 
 //
-// Audio timer callback – fires at AUDIO_SAMPLE_RATE Hz (8 kHz, period = 125 µs).
-// Runs in the esp_timer task (high priority).  It only wakes the sampling task
-// via a direct-to-task notification – no ADC read, no memory writes.  Keeping
-// the callback as short as possible prevents it from starving the idle task and
-// triggering the Task Watchdog Timer (TWDT).
+// ADC continuous-mode DMA callback – runs in ISR context once per DMA frame
+// (AUDIO_CHUNK_SIZE samples = 64 ms at 8 kHz, ~16 wakeups/sec).
+// Hardware DMA clocks samples at exactly AUDIO_SAMPLE_RATE Hz with zero
+// per-sample jitter, which is far better than the ~10–50 µs jitter of the
+// former esp_timer approach.
 //
-static void audioTimerCB(void *)
+// Each raw 12-bit result is shifted to 8-bit, passed through the IIR
+// DC-blocking filter, and written into the double-buffer.  When a chunk fills,
+// the index is queued to the send task (non-blocking; drops if lagging).
+//
+static bool IRAM_ATTR adcConvDoneCB(adc_continuous_handle_t handle,
+                                    const adc_continuous_evt_data_t *edata,
+                                    void *user_data)
 {
-  if(audioTaskH) xTaskNotifyGive(audioTaskH);
-}
+  BaseType_t mustYield = pdFALSE;
+  const adc_digi_output_data_t *p =
+    reinterpret_cast<const adc_digi_output_data_t *>(edata->conv_frame_buffer);
+  uint32_t count = edata->size / sizeof(adc_digi_output_data_t);
 
-//
-// Audio sampling task – wakes once per timer tick (8000 times/sec) via a
-// direct-to-task notification, reads exactly ONE ADC sample, applies the IIR
-// DC-blocking filter, and stores the result.  One sample per wake ensures every
-// sample is spaced exactly 125 µs apart (uniform 8 kHz).
-//
-// Running at priority 2 (just above the Arduino loop) ensures the task is
-// scheduled promptly after each timer notification without starving the idle
-// task that feeds the watchdog.
-//
-// Why one sample per wake matters: batching N reads back-to-back makes those N
-// samples cluster in ~(N × ADC_time) ms instead of being evenly spread over the
-// full 125 µs period.  The browser plays them at exactly 8 kHz, so the real
-// signal is time-stretched → pitch error and severe non-linear distortion.
-//
-static void audioTask(void *)
-{
-  while(ulTaskNotifyTake(pdTRUE, portMAX_DELAY))
+  for(uint32_t i = 0; i < count; i++)
   {
-    if(!audioTimer) break;  // stop signal
+    // Skip invalid results or results from an unexpected channel.
+    if(p[i].type2.flag || p[i].type2.channel != AUDIO_ADC_CHANNEL) continue;
 
-    // One ADC read per wake – perfectly uniform 8 kHz spacing.
-    uint8_t raw = (uint8_t)(analogRead(AUDIO_PIN) >> 4);  // 12-bit → 8-bit unsigned
+    uint8_t raw = (uint8_t)(p[i].type2.data >> 4);  // 12-bit → 8-bit unsigned
 
     // IIR DC-blocking high-pass (Q8 fixed-point, α = 255/256, cutoff ≈ 5 Hz).
     audioDcEst += (int32_t)raw - (audioDcEst >> 8);
@@ -386,19 +382,17 @@ static void audioTask(void *)
       int sendIdx   = audioChunkIdx;
       audioChunkIdx ^= 1;  // swap to the other buffer before handing off
       audioChunkPos  = 0;
-      // Non-blocking: if the send task is lagging, drop the chunk rather than
-      // stalling the sampler.
-      xQueueSend(audioSendQ, &sendIdx, 0);
+      // Non-blocking: drop the chunk rather than stalling if the send task lags.
+      xQueueSendFromISR(audioSendQ, &sendIdx, &mustYield);
     }
   }
-  audioTaskH = nullptr;
-  vTaskDelete(nullptr);
+
+  return mustYield == pdTRUE;
 }
 
 static void startAudioSampling()
 {
-  if(audioTimer) return;
-  analogSetPinAttenuation(AUDIO_PIN, ADC_11db);
+  if(adcHandle) return;
   audioChunkIdx = 0;
   audioChunkPos = 0;
   audioDcEst    = 128 << 8;  // reset DC estimate for a clean start
@@ -406,34 +400,45 @@ static void startAudioSampling()
   // Depth 2: one chunk queued for the send task while the next is filling.
   audioSendQ = xQueueCreate(2, sizeof(int));
 
-  // Send task: priority 2 (same as sampler, above loop) so display-loop
-  // activity cannot delay chunk delivery to the WebSocket client.
+  // Send task: priority 2 (above loop) so display-loop SPI activity cannot
+  // delay chunk delivery to the WebSocket client.
   xTaskCreatePinnedToCore(audioSendTask, "audioSend", 4096, nullptr, 2, &audioSendH, 1);
 
-  // Sampler: priority 2 (just above loop) so it is scheduled promptly after
-  // each timer notification without blocking the idle/watchdog task.
-  xTaskCreatePinnedToCore(audioTask, "audioADC", 4096, nullptr, 2, &audioTaskH, 1);
+  // DMA ring-buffer holds 2 conversion frames so the ISR callback is never
+  // starved even if it is delayed by one frame interval (64 ms).
+  adc_continuous_handle_cfg_t cfg = {};
+  cfg.max_store_buf_size = 2 * AUDIO_CHUNK_SIZE * sizeof(adc_digi_output_data_t);
+  cfg.conv_frame_size    =     AUDIO_CHUNK_SIZE * sizeof(adc_digi_output_data_t);
+  adc_continuous_new_handle(&cfg, &adcHandle);
 
-  esp_timer_create_args_t args = {};
-  args.callback              = audioTimerCB;
-  args.dispatch_method       = ESP_TIMER_TASK;  // ESP_TIMER_ISR not available in esp32 Arduino core 3.x
-  args.name                  = "audioADC";
-  args.skip_unhandled_events = true;  // drop missed ticks; never catch up in a burst
-  esp_timer_create(&args, &audioTimer);
-  // Fire at AUDIO_SAMPLE_RATE Hz (8 kHz, period = 125 µs) – one wake per sample.
-  esp_timer_start_periodic(audioTimer, 1000000ULL / AUDIO_SAMPLE_RATE);
+  // One pattern: ADC2 channel 0 (GPIO11), 12-bit, 11 dB attenuation (0–3.3 V).
+  adc_digi_pattern_config_t pattern = {};
+  pattern.atten     = ADC_ATTEN_DB_12;
+  pattern.channel   = AUDIO_ADC_CHANNEL;
+  pattern.unit      = AUDIO_ADC_UNIT;
+  pattern.bit_width = 12;
+
+  adc_continuous_config_t digCfg = {};
+  digCfg.sample_freq_hz = AUDIO_SAMPLE_RATE;
+  digCfg.conv_mode      = ADC_CONV_SINGLE_UNIT_2;  // only ADC2 channels
+  digCfg.format         = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
+  digCfg.pattern_num    = 1;
+  digCfg.adc_pattern    = &pattern;
+  adc_continuous_config(adcHandle, &digCfg);
+
+  adc_continuous_cbs_t cbs = {};
+  cbs.on_conv_done = adcConvDoneCB;
+  adc_continuous_register_event_callbacks(adcHandle, &cbs, nullptr);
+
+  adc_continuous_start(adcHandle);
 }
 
 static void stopAudioSampling()
 {
-  if(!audioTimer) return;
-  esp_timer_stop(audioTimer);
-  esp_timer_delete(audioTimer);
-  audioTimer = nullptr;  // signals the sampler to exit on its next wake
-
-  // Give one last notification so the sampler sees audioTimer == nullptr and exits.
-  if(audioTaskH) xTaskNotifyGive(audioTaskH);
-  for(int i = 0; i < 200 && audioTaskH; i++) vTaskDelay(1);
+  if(!adcHandle) return;
+  adc_continuous_stop(adcHandle);
+  adc_continuous_deinit(adcHandle);
+  adcHandle = nullptr;
 
   // Send a poison pill to wake and stop the send task.
   if(audioSendQ)
