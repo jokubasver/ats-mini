@@ -6,15 +6,17 @@
 // typical SSB CW sidetone is detected regardless of the exact dial
 // offset, giving ±300 Hz of tolerance around the 700 Hz centre.
 //
-// Requires hardware modification: connect audio IC pin 8 to ESP32 IO11
-// through a lowpass RC filter to remove Class-D PWM switching noise.
+// Hardware modification: connect NS4160 amplifier IC pin 8 (OUTP) to
+// ESP32 IO11 through a lowpass RC filter (1 kΩ series + 100 nF to GND).
+// The filter cutoff at ~1.6 kHz passes the audio while attenuating the
+// Class-D PWM carrier.
 //
-// Note: GPIO11 is on ADC2 of the ESP32-S3. ADC2 may produce unreliable
-// readings when Wi-Fi is active; occasional decode errors are expected
-// in that case.
+// GPIO11 is on ADC2 of the ESP32-S3.  Unlike the original ESP32, ADC2
+// on the ESP32-S3 is fully independent of Wi-Fi and may be used freely.
 
 #include "Common.h"
 #include "CW.h"
+#include <esp_timer.h>
 #include <math.h>
 
 // Morse binary tree table size (covers up to 5-element codes)
@@ -51,13 +53,10 @@
 #define CW_GOERTZEL_K_MAX      9   // Highest bin → k * fs / N = 9 * 4000 / 40 = 900 Hz
 #define CW_NUM_BINS            (CW_GOERTZEL_K_MAX - CW_GOERTZEL_K_MIN + 1)  // 6 bins
 
-// Maximum ADC samples to process in one cwTickTime() call.
-// The main loop contains a delay(5) so it runs at ~200 Hz, far slower than
-// the 4 kHz sample rate.  Processing all overdue samples per call (burst
-// mode) restores the correct effective sample rate without requiring a timer
-// ISR.  Two full blocks (80 samples) is enough to stay caught up even if
-// the display refresh occasionally delays the loop for ~20 ms.
-#define CW_MAX_SAMPLES_PER_CALL  (CW_GOERTZEL_N * 2)  // 80 samples = 2 blocks
+// Ring buffer used to pass ADC samples from the esp_timer callback to the
+// main-loop processor.  Must be a power of 2 and large enough to absorb at
+// least one full display-refresh interval (~20 ms → 80 samples at 4 kHz).
+#define CW_RING_SIZE  128   // 128 samples = 32 ms of headroom
 
 // Goertzel magnitude² thresholds for mark/space detection.
 // The Goertzel magnitude² for a pure sine at a bin frequency with
@@ -173,7 +172,6 @@ static float    cwGQ1[CW_NUM_BINS];     // s[n-1] for each bin
 static float    cwGQ2[CW_NUM_BINS];     // s[n-2] for each bin
 static int      cwGCount = 0;           // Sample count in current block
 static float    cwGCoeff[CW_NUM_BINS];  // 2 * cos(2π * k / N) for each bin, computed in cwInit()
-static uint32_t cwLastSampleUs = 0;     // µs timestamp of last ADC sample
 
 // Long-term DC bias of the ADC input (12-bit, nominally 2048)
 static int32_t  cwDcBias = 2048;
@@ -181,6 +179,34 @@ static int32_t  cwDcBias = 2048;
 // Decoded text ring buffer
 static char    cwText[CW_TEXT_LEN + 1] = "";
 static uint8_t cwTextLen = 0;
+
+// -----------------------------------------------------------------------
+// ADC ring buffer — written by the esp_timer callback, read by cwTickTime()
+// -----------------------------------------------------------------------
+// The esp_timer fires every CW_SAMPLE_US (250 µs) and pushes one ADC
+// sample.  cwTickTime() drains all available samples each main-loop call.
+// Indices are uint8_t so modular arithmetic wraps naturally at 256; the
+// effective buffer length is CW_RING_SIZE (a power of 2).
+
+static volatile int16_t cwRingBuf[CW_RING_SIZE];
+static volatile uint8_t cwRingWrite = 0;  // Written by timer callback
+static volatile uint8_t cwRingRead  = 0;  // Written by cwTickTime()
+
+static esp_timer_handle_t cwSampleTimer = NULL;
+
+// Timer callback: called by the esp_timer task at exactly CW_SAMPLE_RATE Hz.
+// Reads one ADC sample and pushes it into the ring buffer.  If the buffer
+// is full (cwTickTime() is not keeping up), the sample is dropped.
+static void cwSampleCallback(void * /*arg*/)
+{
+  int16_t raw = (int16_t)analogRead(CW_ADC_PIN);
+  uint8_t next = (cwRingWrite + 1) & (CW_RING_SIZE - 1);
+  if(next != cwRingRead)
+  {
+    cwRingBuf[cwRingWrite] = raw;
+    cwRingWrite = next;
+  }
+}
 
 // -----------------------------------------------------------------------
 // Internal helpers
@@ -260,10 +286,33 @@ void cwInit(void)
   cwMarkActive   = false;
   cwDcBias       = 2048;
   cwGCount       = 0;
-  cwLastSampleUs = micros();
   cwTextLen      = 0;
   cwText[0]      = '\0';
   cwLetterDecoded = false;
+
+  // Reset ring buffer
+  cwRingWrite = cwRingRead = 0;
+
+  // Start (or restart) the 4 kHz ADC sampling timer.
+  // Stop and delete any previously running timer first.
+  if(cwSampleTimer != NULL)
+  {
+    esp_timer_stop(cwSampleTimer);
+    esp_timer_delete(cwSampleTimer);
+    cwSampleTimer = NULL;
+  }
+
+  const esp_timer_create_args_t timerArgs =
+  {
+    .callback             = cwSampleCallback,
+    .arg                  = NULL,
+    .dispatch_method      = ESP_TIMER_TASK,
+    .name                 = "cw_sample",
+    .skip_unhandled_events = true,
+  };
+
+  if(esp_timer_create(&timerArgs, &cwSampleTimer) == ESP_OK)
+    esp_timer_start_periodic(cwSampleTimer, CW_SAMPLE_US);
 }
 
 // Called every main-loop iteration.  Returns true when the decoded text
@@ -274,36 +323,20 @@ bool cwTickTime(void)
   bool     changed = false;
 
   // -----------------------------------------------------------------------
-  // ADC sampling paced at CW_SAMPLE_RATE Hz using micros().
+  // Drain ADC samples from the ring buffer populated by the 4 kHz timer.
   //
-  // The main loop runs at ~200 Hz (5 ms delay() + display overhead), far
-  // slower than the 4 kHz sample rate.  To maintain the correct effective
-  // sample rate without a timer ISR, all overdue samples are processed in
-  // one call (burst mode), up to CW_MAX_SAMPLES_PER_CALL.
-  //
-  // If we've fallen more than one full block behind (e.g. CW was just
-  // enabled after a long pause), the gap is discarded and state is reset
-  // to avoid filling the Goertzel registers with stale data.
+  // Because the timer fires at the correct hardware rate, every sample is
+  // genuinely 250 µs apart and the Goertzel frequency bins are accurate.
   // -----------------------------------------------------------------------
-  uint32_t nowUs = micros();
-
-  if((nowUs - cwLastSampleUs) > (uint32_t)(CW_SAMPLE_US * CW_GOERTZEL_N))
+  while(cwRingRead != cwRingWrite)
   {
-    cwLastSampleUs = nowUs;
-    cwGCount = 0;
-    for(int i = 0; i < CW_NUM_BINS; i++) cwGQ1[i] = cwGQ2[i] = 0.0f;
-  }
-
-  for(int s = 0; s < CW_MAX_SAMPLES_PER_CALL; s++)
-  {
-    if((nowUs - cwLastSampleUs) < (uint32_t)CW_SAMPLE_US) break;
-    cwLastSampleUs += CW_SAMPLE_US;
+    int32_t raw = cwRingBuf[cwRingRead];
+    cwRingRead = (cwRingRead + 1) & (CW_RING_SIZE - 1);
 
     // Read ADC and remove slowly-tracked DC offset.
     // The ESP32-S3 ADC is 12-bit (0–4095); cwDcBias is initialised to 2048.
     // α = 1/256 gives a time constant of ~256 samples = 64 ms at 4 kHz,
     // long enough to track slow DC drift without following the audio signal.
-    int32_t raw = analogRead(CW_ADC_PIN);
     cwDcBias += (raw - cwDcBias) >> 8;
     float x = (float)(raw - cwDcBias);
 
