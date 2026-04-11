@@ -51,17 +51,25 @@
 #define CW_GOERTZEL_K_MAX      9   // Highest bin → k * fs / N = 9 * 4000 / 40 = 900 Hz
 #define CW_NUM_BINS            (CW_GOERTZEL_K_MAX - CW_GOERTZEL_K_MIN + 1)  // 6 bins
 
+// Maximum ADC samples to process in one cwTickTime() call.
+// The main loop contains a delay(5) so it runs at ~200 Hz, far slower than
+// the 4 kHz sample rate.  Processing all overdue samples per call (burst
+// mode) restores the correct effective sample rate without requiring a timer
+// ISR.  Two full blocks (80 samples) is enough to stay caught up even if
+// the display refresh occasionally delays the loop for ~20 ms.
+#define CW_MAX_SAMPLES_PER_CALL  (CW_GOERTZEL_N * 2)  // 80 samples = 2 blocks
+
 // Goertzel magnitude² thresholds for mark/space detection.
 // The Goertzel magnitude² for a pure sine at a bin frequency with
 // ADC amplitude A (12-bit, 0–4095) is approximately (N/2 * A)² = (20*A)².
-// So CW_THRESHOLD_ON²  = 1500² = 2 250 000 corresponds to A ≈ 75 counts.
-//    CW_THRESHOLD_OFF² =  600² =   360 000 corresponds to A ≈ 30 counts.
+// So CW_THRESHOLD_ON²  = 1000² = 1 000 000 corresponds to A ≈ 50 counts (≈ 40 mV peak).
+//    CW_THRESHOLD_OFF² =  400² =   160 000 corresponds to A ≈ 20 counts (≈ 16 mV peak).
 // These thresholds apply to each individual bin; a mark is declared when
 // ANY bin exceeds CW_THRESHOLD_ON2.
 // Increase CW_THRESHOLD_ON if noise triggers false decoding;
 // decrease it if weak signals are missed.
-#define CW_THRESHOLD_ON2   (1500.0f * 1500.0f)  // Magnitude² to declare tone present
-#define CW_THRESHOLD_OFF2   (600.0f *  600.0f)  // Magnitude² to declare tone absent
+#define CW_THRESHOLD_ON2   (1000.0f * 1000.0f)  // Magnitude² to declare tone present
+#define CW_THRESHOLD_OFF2   (400.0f *  400.0f)  // Magnitude² to declare tone absent
 
 // Timing parameters
 #define CW_MIN_MARK_MS    10   // Minimum mark duration — rejects short noise spikes
@@ -267,20 +275,29 @@ bool cwTickTime(void)
 
   // -----------------------------------------------------------------------
   // ADC sampling paced at CW_SAMPLE_RATE Hz using micros().
-  // One sample is taken per call if the target interval has elapsed.
-  // Each block of CW_GOERTZEL_N samples runs the Goertzel algorithm and
-  // updates cwMarkActive with hysteresis.
+  //
+  // The main loop runs at ~200 Hz (5 ms delay() + display overhead), far
+  // slower than the 4 kHz sample rate.  To maintain the correct effective
+  // sample rate without a timer ISR, all overdue samples are processed in
+  // one call (burst mode), up to CW_MAX_SAMPLES_PER_CALL.
+  //
+  // If we've fallen more than one full block behind (e.g. CW was just
+  // enabled after a long pause), the gap is discarded and state is reset
+  // to avoid filling the Goertzel registers with stale data.
   // -----------------------------------------------------------------------
   uint32_t nowUs = micros();
-  uint32_t elapsed = nowUs - cwLastSampleUs;
-  if(elapsed >= (uint32_t)CW_SAMPLE_US)
+
+  if((nowUs - cwLastSampleUs) > (uint32_t)(CW_SAMPLE_US * CW_GOERTZEL_N))
   {
-    // Advance timestamp by one period; if we've fallen more than one period
-    // behind (e.g. after a long redraw), resync to avoid a burst of samples.
-    if(elapsed >= 2u * (uint32_t)CW_SAMPLE_US)
-      cwLastSampleUs = nowUs;
-    else
-      cwLastSampleUs += CW_SAMPLE_US;
+    cwLastSampleUs = nowUs;
+    cwGCount = 0;
+    for(int i = 0; i < CW_NUM_BINS; i++) cwGQ1[i] = cwGQ2[i] = 0.0f;
+  }
+
+  for(int s = 0; s < CW_MAX_SAMPLES_PER_CALL; s++)
+  {
+    if((nowUs - cwLastSampleUs) < (uint32_t)CW_SAMPLE_US) break;
+    cwLastSampleUs += CW_SAMPLE_US;
 
     // Read ADC and remove slowly-tracked DC offset.
     // The ESP32-S3 ADC is 12-bit (0–4095); cwDcBias is initialised to 2048.
