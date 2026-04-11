@@ -274,13 +274,13 @@ void setup()
 }
 
 
-int16_t accelerateEncoder(int8_t dir)
+ICACHE_RAM_ATTR int16_t accelerateEncoder(int8_t dir)
 {
   const uint32_t speedThresholds[] = {350, 60, 45, 35, 25}; // ms between clicks
-  const uint16_t accelFactors[] =      {1,  2,  4,  8, 16}; // corresponding multipliers
+  const uint16_t accelFactors[]    =   {1,   2,  4,  8, 16}; // corresponding multipliers
   static uint32_t lastEncoderTime = 0;
   static uint32_t lastSpeed = speedThresholds[0];
-  static uint16_t lastAccelFactor = accelFactors[0];
+  static uint8_t lastAccelIdx = 0;
   static int8_t lastEncoderDir = 0;
 
   uint32_t currentTime = millis();
@@ -289,21 +289,27 @@ int16_t accelerateEncoder(int8_t dir)
   // Reset acceleration on timeout or direction change
   if (lastSpeed > speedThresholds[0] || lastEncoderDir != dir) {
     lastSpeed = speedThresholds[0];
-    lastAccelFactor = accelFactors[0];
+    lastAccelIdx = 0;
   } else {
-    // Lookup acceleration factor
+    // Find the target acceleration level for the current speed
+    uint8_t targetIdx = 0;
     for (int8_t i = LAST_ITEM(speedThresholds); i >= 0; i--) {
-      if (lastSpeed <= speedThresholds[i] && lastAccelFactor < accelFactors[i]) {
-        lastAccelFactor = accelFactors[i];
+      if (lastSpeed <= speedThresholds[i]) {
+        targetIdx = (uint8_t)i;
         break;
       }
     }
+    // Ramp up instantly; ramp down one level at a time to resist noise-induced drops
+    if (targetIdx >= lastAccelIdx)
+      lastAccelIdx = targetIdx;
+    else if (lastAccelIdx > 0)
+      lastAccelIdx--;
   }
+
   lastEncoderTime = currentTime;
   lastEncoderDir = dir;
 
-  // Apply acceleration with direction
-  return(dir * lastAccelFactor);
+  return dir * accelFactors[lastAccelIdx];
 }
 
 //
