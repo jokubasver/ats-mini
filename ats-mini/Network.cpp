@@ -320,18 +320,15 @@ static bool wifiConnect()
 //
 // Audio timer callback – fires at AUDIO_SAMPLE_RATE Hz.
 // Uses ESP_TIMER_TASK dispatch (the only option available in arduino core
-// 3.3.7 / ESP-IDF 5.1).  The callback itself does no heavy work: it just
-// wakes the audio task on core 1 via a binary semaphore so that all ADC
-// reads and WebSocket sends happen there, away from the WiFi stack on core 0.
+// 3.3.7 / ESP-IDF 5.1).  The callback runs in a task context, not an ISR,
+// so the regular (non-ISR) semaphore API must be used.  It does no heavy
+// work: it just wakes the audio task on core 1 via a binary semaphore so
+// that all ADC reads and WebSocket sends happen there, away from the WiFi
+// stack which runs on core 0.
 //
-static void IRAM_ATTR audioTimerCB(void *)
+static void audioTimerCB(void *)
 {
-  if(audioSem)
-  {
-    BaseType_t hp = pdFALSE;
-    xSemaphoreGiveFromISR(audioSem, &hp);
-    if(hp) portYIELD_FROM_ISR();
-  }
+  if(audioSem) xSemaphoreGive(audioSem);
 }
 
 //
@@ -369,8 +366,9 @@ static void startAudioSampling()
   audioSem = xSemaphoreCreateBinary();
 
   // Pin audio task to core 1 (Arduino loop core) so it doesn't compete
-  // with the WiFi stack which runs on core 0.
-  xTaskCreatePinnedToCore(audioTask, "audioADC", 2048, nullptr, 2, &audioTaskH, 1);
+  // with the WiFi stack which runs on core 0.  Stack must be large enough
+  // for analogRead()'s deep HAL call chain plus binaryAll()'s AsyncTCP layers.
+  xTaskCreatePinnedToCore(audioTask, "audioADC", 8192, nullptr, 2, &audioTaskH, 1);
 
   esp_timer_create_args_t args = {};
   args.callback              = audioTimerCB;
