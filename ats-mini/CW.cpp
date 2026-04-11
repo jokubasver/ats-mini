@@ -198,8 +198,9 @@ static uint16_t cwSampleLevel(void)
     absSum += (diff < 0 ? -diff : diff);
   }
 
-  // Slowly track DC bias (EMA, time constant ≈ 64 calls)
-  cwDcBias += (sum / CW_NUM_SAMPLES - cwDcBias) >> 6;
+  // Slowly track DC bias (EMA, time constant ≈ 64 calls).
+  // Compute error without intermediate integer division to reduce quantization.
+  cwDcBias += ((sum - cwDcBias * CW_NUM_SAMPLES) / CW_NUM_SAMPLES) >> 6;
 
   return (uint16_t)(absSum / CW_NUM_SAMPLES);
 }
@@ -262,8 +263,8 @@ bool cwTickTime(void)
           if(dur < cwDitLen * 2)
           {
             // Dit — navigate to left child
-            if(cwCode < 32) cwCode *= 2;
-            else            cwCode  = 0;  // Overflow: too many elements
+            if(cwCode * 2 < MORSE_TREE_SIZE) cwCode *= 2;
+            else                             cwCode  = 0;  // Overflow: too many elements
 
             // Update dit-length estimate (EMA α ≈ 0.25)
             cwDitLen = (cwDitLen * 3 + dur) / 4;
@@ -271,8 +272,8 @@ bool cwTickTime(void)
           else
           {
             // Dah — navigate to right child
-            if(cwCode < 32) cwCode = cwCode * 2 + 1;
-            else            cwCode = 0;  // Overflow
+            if(cwCode * 2 + 1 < MORSE_TREE_SIZE) cwCode = cwCode * 2 + 1;
+            else                                  cwCode = 0;  // Overflow
 
             // Estimate dit from dah duration (standard ratio = 3:1)
             cwDitLen = (cwDitLen * 3 + dur / 3) / 4;
