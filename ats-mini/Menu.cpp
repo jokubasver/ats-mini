@@ -5,6 +5,7 @@
 #include "Draw.h"
 #include "EIBI.h"
 #include "Ble.h"
+#include "CW.h"
 #include "Menu.h"
 
 //
@@ -126,7 +127,8 @@ static const char *menu[] =
 #define MENU_USBMODE      13
 #define MENU_BLEMODE      14
 #define MENU_WIFIMODE     15
-#define MENU_ABOUT        16
+#define MENU_DECODER      16
+#define MENU_ABOUT        17
 
 
 int8_t settingsIdx = MENU_BRIGHTNESS;
@@ -149,6 +151,7 @@ static const char *settings[] =
   "USB Port",
   "Bluetooth",
   "Wi-Fi",
+  "Decoder",
   "About",
 };
 
@@ -296,6 +299,14 @@ int getTotalBleModes() { return(ITEM_COUNT(bleModeDesc)); }
 uint8_t wifiModeIdx = NET_OFF;
 static const char *wifiModeDesc[] =
 { "Off", "AP Only", "AP+Connect", "Connect", "Sync Only" };
+
+//
+// Decoder Mode Menu
+//
+
+uint8_t decoderModeIdx = DECODER_OFF;
+static const char *decoderModeDesc[] =
+{ "Off", "CW" };
 
 //
 // Step Menu
@@ -641,6 +652,14 @@ static void doWiFiMode(int16_t enc)
   wifiModeIdx = wrap_range(wifiModeIdx, enc, 0, LAST_ITEM(wifiModeDesc));
 }
 
+static void doDecoderMode(int16_t enc)
+{
+  uint8_t newIdx = wrap_range(decoderModeIdx, enc, 0, LAST_ITEM(decoderModeDesc));
+  // Clear any accumulated decoded text when turning the decoder off
+  if(newIdx == DECODER_OFF) clearCwText();
+  decoderModeIdx = newIdx;
+}
+
 static void clickWiFiMode(uint8_t mode, bool shortPress)
 {
   currentCmd = CMD_NONE;
@@ -920,6 +939,7 @@ static void clickSettings(int cmd, bool shortPress)
     case MENU_USBMODE:    currentCmd = CMD_USBMODE;    break;
     case MENU_BLEMODE:    currentCmd = CMD_BLEMODE;    break;
     case MENU_WIFIMODE:   currentCmd = CMD_WIFIMODE;   break;
+    case MENU_DECODER:    currentCmd = CMD_DECODER;    break;
     case MENU_FM_REGION:
       // Only in FM mode
       if(currentMode==FM) currentCmd = CMD_FM_REGION;
@@ -963,6 +983,7 @@ bool doSideBar(uint16_t cmd, int16_t enc, int16_t enca)
     case CMD_USBMODE:    doUSBMode(scrollDirection * enc);break;
     case CMD_BLEMODE:    doBleMode(scrollDirection * enc);break;
     case CMD_WIFIMODE:   doWiFiMode(scrollDirection * enc);break;
+    case CMD_DECODER:    doDecoderMode(scrollDirection * enc);break;
     case CMD_ZOOM:       doZoom(enc);break;
     case CMD_SCROLL:     doScrollDir(enc);break;
     case CMD_UTCOFFSET:  doUTCOffset(scrollDirection * enc);break;
@@ -1313,6 +1334,30 @@ static void drawWiFiMode(int x, int y, int sx)
 
     spr.setTextDatum(MC_DATUM);
     spr.drawString(wifiModeDesc[abs((wifiModeIdx+count+i)%count)], 40+x+(sx/2), 64+y+(i*16), 2);
+  }
+}
+
+static void drawDecoderMode(int x, int y, int sx)
+{
+  drawCommon(settings[MENU_DECODER], x, y, sx, true);
+
+  int count = ITEM_COUNT(decoderModeDesc);
+  for(int i=-2 ; i<3 ; i++)
+  {
+    if(i==0) {
+      drawZoomedMenu(decoderModeDesc[abs((decoderModeIdx+count+i)%count)]);
+      spr.setTextColor(TH.menu_hl_text, TH.menu_hl_bg);
+    } else {
+      spr.setTextColor(TH.menu_item);
+    }
+
+    // Prevent repeats for short menus
+    if (count < 5 && ((decoderModeIdx+i) < 0 || (decoderModeIdx+i) >= count)) {
+      continue;
+    }
+
+    spr.setTextDatum(MC_DATUM);
+    spr.drawString(decoderModeDesc[abs((decoderModeIdx+count+i)%count)], 40+x+(sx/2), 64+y+(i*16), 2);
   }
 }
 
@@ -1728,6 +1773,7 @@ void drawSideBar(uint16_t cmd, int x, int y, int sx)
     case CMD_USBMODE:    drawUSBMode(x, y, sx);    break;
     case CMD_BLEMODE:    drawBleMode(x, y, sx);    break;
     case CMD_WIFIMODE:   drawWiFiMode(x, y, sx);   break;
+    case CMD_DECODER:    drawDecoderMode(x, y, sx);break;
     case CMD_ZOOM:       drawZoom(x, y, sx);       break;
     case CMD_SCROLL:     drawScrollDir(x, y, sx);  break;
     case CMD_UTCOFFSET:  drawUTCOffset(x, y, sx);  break;

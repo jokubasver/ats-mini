@@ -79,6 +79,10 @@
 #define USB_OFF        0 // USB is disabled
 #define USB_ADHOC      1 // Ad hoc serial protocol
 
+// Decoder modes
+#define DECODER_OFF    0 // No decoder active
+#define DECODER_CW     1 // CW (Morse code) decoder
+
 //
 // Data Types
 //
@@ -165,6 +169,7 @@ extern uint8_t usbModeIdx;
 extern uint8_t bleModeIdx;
 extern uint8_t wifiModeIdx;
 extern uint8_t FmRegionIdx;
+extern uint8_t decoderModeIdx;
 
 extern int8_t agcIdx;
 extern int8_t agcNdx;

@@ -46,6 +46,7 @@
 #define CMD_WIFIMODE   0x2F00 // |
 #define CMD_ABOUT      0x3000 //-+
 #define CMD_DIM        0x3100 // Display dim timeout
+#define CMD_DECODER    0x3200 // Decoder mode
 
 // UI Layouts
 #define UI_DEFAULT  0

@@ -984,7 +984,7 @@ void loop()
   }
 
   // Process CW (Morse code) decoding from audio ADC input (AM/SSB modes only)
-  if(currentMode != FM)
+  if(currentMode != FM && decoderModeIdx == DECODER_CW)
     needRedraw |= cwTickTime();
 
   // Periodically check schedule
