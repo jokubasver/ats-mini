@@ -212,10 +212,10 @@ void drawLayoutSmeter(const char *statusLine1, const char *statusLine2)
   }
   else if(!drawWiFiStatus(statusLine1, statusLine2, STATUS_OFFSET_X, STATUS_OFFSET_Y))
   {
-    // Show radio text if present, else CW text (in AM/SSB modes), else S & SN meters
+    // Show radio text if present, else CW text, else S & SN meters
     if(*getRadioText() || *getProgramInfo())
       drawRadioText(STATUS_OFFSET_Y, STATUS_OFFSET_Y + 25);
-    else if(currentMode != FM && *getCwText())
+    else if(*getCwText())
       drawCwText(STATUS_OFFSET_X, STATUS_OFFSET_Y);
     else
     {
