@@ -1,0 +1,1 @@
+Add display dimming on idle option ("Dim" in Settings). When set to a non-zero value, the display dims to minimum brightness after the specified number of seconds of inactivity. Any encoder rotation or button press restores full brightness.

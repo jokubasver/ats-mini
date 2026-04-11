@@ -72,6 +72,7 @@ uint8_t FmRegionIdx = 0;                // FM Region
 
 uint16_t currentBrt = 130;              // Display brightness, range = 10 to 255 in steps of 5
 uint16_t currentSleep = DEFAULT_SLEEP;  // Display sleep timeout, range = 0 to 255 in steps of 5
+uint16_t currentDim = 0;               // Display dim timeout, range = 0 (off) to 255 in steps of 5
 long elapsedSleep = millis();           // Display sleep timer
 bool zoomMenu = false;                  // Display zoomed menu item
 int8_t scrollDirection = 1;             // Menu scroll direction
@@ -780,6 +781,10 @@ void loop()
   // Block encoder rotation when in the locked sleep mode
   if(encCount && sleepOn() && sleepModeIdx==SLEEP_LOCKED) encCount = encCountAccel = 0;
 
+  // Wake display from dim if any user interaction is detected
+  if(dimOn() && (encCount || pb1st.wasClicked || pb1st.wasShortPressed || pb1st.isLongPressed))
+    dimOn(false);
+
   // Activate push and rotate mode (can span multiple loop iterations until the button is released)
   if (encCount && pb1st.isPressed) pushAndRotate = true;
 
@@ -942,6 +947,10 @@ void loop()
     // CPU sleep can take long time, renew the timestamps
     elapsedSleep = elapsedCommand = currentTime = millis();
   }
+
+  // Display dim timeout
+  if(currentDim && !dimOn() && !sleepOn() && ((currentTime - elapsedSleep) > currentDim * 1000))
+    dimOn(true);
 
   if((currentTime - elapsedRSSI) > MIN_ELAPSED_RSSI_TIME)
   {

@@ -14,6 +14,9 @@ extern ButtonTracker pb1;
 // Current sleep status, returned by sleepOn()
 static bool sleep_on = false;
 
+// Current dim status, returned by dimOn()
+static bool dim_on = false;
+
 // Current SSB patch status
 static bool ssbLoaded = false;
 
@@ -193,6 +196,7 @@ bool sleepOn(int x)
   if((x==1) && !sleep_on)
   {
     sleep_on = true;
+    dim_on = false;
     ledcWrite(PIN_LCD_BL, 0);
     spr.fillSprite(TFT_BLACK);
     spr.pushSprite(0, 0);
@@ -249,6 +253,7 @@ bool sleepOn(int x)
   else if((x==0) && sleep_on)
   {
     sleep_on = false;
+    dim_on = false;
     tft.writecommand(ST7789_SLPOUT);
     delay(120);
     tft.writecommand(ST7789_DISPON);
@@ -261,6 +266,25 @@ bool sleepOn(int x)
   }
 
   return(sleep_on);
+}
+
+//
+// Turn dim on (1) or off (0), or get current status (2)
+//
+bool dimOn(int x)
+{
+  if((x==1) && !dim_on && !sleep_on)
+  {
+    dim_on = true;
+    ledcWrite(PIN_LCD_BL, 10);
+  }
+  else if((x==0) && dim_on)
+  {
+    dim_on = false;
+    if(!sleep_on) ledcWrite(PIN_LCD_BL, currentBrt);
+  }
+
+  return(dim_on);
 }
 
 //
