@@ -68,8 +68,6 @@ static char bufStationName[50]    = "";
 static char stageStationName[50]  = "";
 static uint32_t stageStationNameMs = 0;
 static char bufRadioText[100]     = "";
-static char stageRadioText[100]   = "";
-static uint32_t stageRadioTextMs  = 0;
 static char bufProgramInfo[100]   = "";
 static uint16_t piCode = 0x0000;
 
@@ -104,8 +102,6 @@ void clearStationInfo()
   bufProgramInfo[0]  = '\0';
   bufRadioText[0]    = '\0'; // Multiline!
   bufRadioText[1]    = '\0';
-  memset(stageRadioText, 0, sizeof(stageRadioText));
-  stageRadioTextMs   = 0;
   piCode = 0x0000;
 }
 
@@ -127,12 +123,6 @@ static bool showStationName(const char *stationName, bool isLong = false)
 
   return(false);
 }
-
-// Minimum milliseconds the processed RT must be unchanged before it is
-// committed to the display buffer.  RDS groups arrive every ~87 ms, so
-// 300 ms ensures at least three full groups have been received without
-// a change, i.e. the current RT cycle has stabilised.
-#define RT_STABLE_MS 300
 
 static bool showRadioText(const char *radioText, uint8_t width = 32)
 {
@@ -176,31 +166,11 @@ static bool showRadioText(const char *radioText, uint8_t width = 32)
   newBuf[d+1] = '\0';
 
   // Compare the full 100-byte buffer so a length change is always detected
-  if(memcmp(newBuf, stageRadioText, sizeof(newBuf)) != 0)
-  {
-    // Content changed — update staging buffer and restart the stability timer.
-    // Do not touch the display buffer yet.
-    memcpy(stageRadioText, newBuf, sizeof(stageRadioText));
-    stageRadioTextMs = millis();
-    return(false);
-  }
-
-  // Content is the same as last time — has it been stable long enough?
-  if((millis() - stageRadioTextMs) < RT_STABLE_MS)
+  if(memcmp(newBuf, bufRadioText, sizeof(newBuf)) == 0)
     return(false);
 
-  // Stable for RT_STABLE_MS — commit to the display buffer
-  bool changed = false;
-  changed |= bufRadioText[d] || bufRadioText[d+1];
-  for(int k=0 ; k<d ; k++)
-  {
-    changed |= newBuf[k] != bufRadioText[k];
-    bufRadioText[k] = newBuf[k];
-  }
-  bufRadioText[d]   = '\0';
-  bufRadioText[d+1] = '\0';
-
-  return(changed);
+  memcpy(bufRadioText, newBuf, sizeof(bufRadioText));
+  return(true);
 }
 
 static bool showProgramInfo(const char *programInfo)
