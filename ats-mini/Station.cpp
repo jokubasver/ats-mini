@@ -67,6 +67,7 @@ const char *rbdsProgramTypes[32] =
 static char bufStationName[50]   = "";
 static char bufRadioText[100]    = "";
 static char stageRadioText[100]  = "";
+static uint32_t stageRadioTextMs = 0;
 static char bufProgramInfo[100]  = "";
 static uint16_t piCode = 0x0000;
 
@@ -101,6 +102,7 @@ void clearStationInfo()
   bufRadioText[1]    = '\0';
   stageRadioText[0]  = '\0'; // Reset staging buffer too
   stageRadioText[1]  = '\0';
+  stageRadioTextMs   = 0;
   piCode = 0x0000;
 }
 
@@ -123,10 +125,15 @@ static bool showStationName(const char *stationName, bool isLong = false)
   return(false);
 }
 
+// Minimum milliseconds the processed RT must be unchanged before it is
+// committed to the display buffer.  RDS groups arrive every ~87 ms, so
+// 300 ms ensures at least three full groups have been received without
+// a change, i.e. the current RT cycle has stabilised.
+#define RT_STABLE_MS 300
+
 static bool showRadioText(const char *radioText, uint8_t width = 32)
 {
   char newBuf[100] = {};
-  bool changed = false;
   int i, d, j;
   char c;
 
@@ -161,30 +168,34 @@ static bool showRadioText(const char *radioText, uint8_t width = 32)
   // Skip trailing whitespace
   while((d>0) && (newBuf[d-1]<=' ')) d--;
 
-  // Double-null terminate
+  // Double-null terminate (newBuf is zero-initialised so the rest is already 0)
   newBuf[d]   = '\0';
   newBuf[d+1] = '\0';
 
-  // Only commit to the display buffer when two consecutive calls produce the same
-  // processed result. This prevents garbled text during in-progress RT updates,
-  // which arrive 4 characters at a time from the SI4735 library.
-  if(memcmp(newBuf, stageRadioText, d+2) == 0)
+  // Compare the full 100-byte buffer so a length change is always detected
+  if(memcmp(newBuf, stageRadioText, sizeof(newBuf)) != 0)
   {
-    // Text is stable — update display buffer if it differs
-    changed |= bufRadioText[d] || bufRadioText[d+1];
-    for(int k=0 ; k<d ; k++)
-    {
-      changed |= newBuf[k] != bufRadioText[k];
-      bufRadioText[k] = newBuf[k];
-    }
-    bufRadioText[d]   = '\0';
-    bufRadioText[d+1] = '\0';
+    // Content changed — update staging buffer and restart the stability timer.
+    // Do not touch the display buffer yet.
+    memcpy(stageRadioText, newBuf, sizeof(stageRadioText));
+    stageRadioTextMs = millis();
+    return(false);
   }
-  else
+
+  // Content is the same as last time — has it been stable long enough?
+  if((millis() - stageRadioTextMs) < RT_STABLE_MS)
+    return(false);
+
+  // Stable for RT_STABLE_MS — commit to the display buffer
+  bool changed = false;
+  changed |= bufRadioText[d] || bufRadioText[d+1];
+  for(int k=0 ; k<d ; k++)
   {
-    // Text is still changing — update stage only, do not touch the display buffer
-    memcpy(stageRadioText, newBuf, d+2);
+    changed |= newBuf[k] != bufRadioText[k];
+    bufRadioText[k] = newBuf[k];
   }
+  bufRadioText[d]   = '\0';
+  bufRadioText[d+1] = '\0';
 
   return(changed);
 }
