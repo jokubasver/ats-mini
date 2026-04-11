@@ -21,20 +21,14 @@
 #define AUDIO_PIN          11    // GPIO11 – ADC input from NS4160 pin 8 via RC filter
 #define AUDIO_SAMPLE_RATE  8000  // 8 kHz sample rate
 #define AUDIO_CHUNK_SIZE   512   // Samples per WebSocket message (64 ms at 8 kHz)
-// AUDIO_BATCH: ADC reads per timer tick.  Timer fires at
-//   AUDIO_SAMPLE_RATE/AUDIO_BATCH Hz (125 Hz, period = 8 ms).
-// 64 reads × ~60 µs = ~3.84 ms active time, safely within the 8 ms
-// window even when the display task shares the same core.
-#define AUDIO_BATCH        64
 
 static uint8_t            audioChunk[2][AUDIO_CHUNK_SIZE]; // double buffer
 static volatile int       audioChunkIdx = 0;               // active write buffer
 static volatile int       audioChunkPos = 0;
 static esp_timer_handle_t audioTimer    = nullptr;
-static SemaphoreHandle_t  audioSem      = nullptr;
+static int32_t            audioDcEst    = 128 << 8;        // Q8 DC estimate for IIR HP filter
 static AsyncWebSocket     audioWS("/audiows");
 static QueueHandle_t      audioSendQ    = nullptr;         // completed chunk indices → send task
-static TaskHandle_t       audioTaskH    = nullptr;
 static TaskHandle_t       audioSendH    = nullptr;
 
 WiFiMulti wifiMulti;
@@ -326,11 +320,9 @@ static bool wifiConnect()
 
 //
 // Audio send task – runs on core 1 at FreeRTOS priority 1 (same as loop).
-// Receives completed buffer indices through a queue and calls binaryAll() only
-// after the sampler has already moved to the other buffer.  Keeping I/O here
-// prevents any TCP-stack stall from pausing ADC collection and causing ticks.
-// Priority 1 (not 0) ensures the display loop cannot starve this task and
-// cause the send queue to fill up, which would drop chunks and produce drop-outs.
+// Receives completed chunk indices from the timer callback via a queue and
+// sends them over the WebSocket.  Keeping the potentially-slow binaryAll() here
+// prevents any TCP-stack stall from blocking the 8 kHz timer callback.
 //
 static void audioSendTask(void *)
 {
@@ -346,59 +338,38 @@ static void audioSendTask(void *)
 }
 
 //
-// Audio timer callback – fires at AUDIO_SAMPLE_RATE/AUDIO_BATCH Hz (125 Hz).
-// Runs in the esp_timer task context on core 0.  Just wakes the audio task on
-// core 1 via a binary semaphore; all ADC reads happen there, away from WiFi.
+// Audio timer callback – fires at AUDIO_SAMPLE_RATE Hz (8 kHz, period = 125 µs).
+// Reads exactly one ADC sample per tick so every sample is uniformly spaced.
+//
+// Why one sample per tick matters: batching N reads back-to-back makes those N
+// samples cluster in ~(N × ADC_time) ms instead of being evenly spread over the
+// full timer period.  The browser plays all N samples at exactly 8 kHz, so the
+// real signal gets time-stretched → pitch error and severe non-linear distortion.
+//
+// A single-pole IIR high-pass (~5 Hz cutoff, α = 255/256) removes DC bias from
+// the ADC so there are no abrupt level jumps at WebSocket buffer boundaries.
 //
 static void audioTimerCB(void *)
 {
-  if(audioSem) xSemaphoreGive(audioSem);
-}
+  // One ADC read per 125 µs tick – perfectly uniform 8 kHz sampling.
+  uint8_t raw = (uint8_t)(analogRead(AUDIO_PIN) >> 4);  // 12-bit → 8-bit unsigned
 
-//
-// Audio sampling task – runs on core 1 at priority 1 (same as loop).
-// Wakes on each semaphore give (AUDIO_SAMPLE_RATE/AUDIO_BATCH = 125 times/sec),
-// then reads AUDIO_BATCH ADC samples.  A single-pole IIR high-pass filter
-// (~5 Hz cutoff) removes DC offset before the samples are stored, preventing
-// audible clicks at buffer boundaries caused by DC level changes between
-// sessions.
-//
-// Timing strategy: esp_timer (µs-precision) with skip_unhandled_events=true.
-// If the display task preempts and a tick is missed, the skipped tick is simply
-// dropped (a few silent samples) rather than caught up in a burst.  Catch-up
-// bursts (the vTaskDelayUntil behaviour) injected extra samples, making the
-// effective rate exceed 8 kHz and producing the "pitch too low" symptom.
-//
-static void audioTask(void *)
-{
-  int32_t dcEst = 128 << 8;  // Q8 fixed-point DC estimate; reset fresh each session
-  while(xSemaphoreTake(audioSem, portMAX_DELAY) == pdTRUE)
+  // IIR DC-blocking high-pass (Q8 fixed-point).
+  audioDcEst += (int32_t)raw - (audioDcEst >> 8);
+  int s = (int)raw - (audioDcEst >> 8) + 128;
+  if(s < 0)   s = 0;
+  if(s > 255) s = 255;
+
+  audioChunk[audioChunkIdx][audioChunkPos++] = (uint8_t)s;
+  if(audioChunkPos >= AUDIO_CHUNK_SIZE)
   {
-    if(!audioTimer) break;  // stop signal
-    for(int i = 0; i < AUDIO_BATCH; i++)
-    {
-      // Scale 12-bit ADC → 8-bit unsigned PCM.
-      uint8_t raw = (uint8_t)(analogRead(AUDIO_PIN) >> 4);
-      // IIR DC-blocking high-pass: α = 1 - 1/256, cutoff ≈ 5 Hz at 8 kHz.
-      // dcEst tracks the running DC level in Q8 fixed-point (×256).
-      dcEst += (int32_t)raw - (dcEst >> 8);
-      int s = (int)raw - (dcEst >> 8) + 128;
-      if(s < 0)   s = 0;
-      if(s > 255) s = 255;
-      audioChunk[audioChunkIdx][audioChunkPos++] = (uint8_t)s;
-      if(audioChunkPos >= AUDIO_CHUNK_SIZE)
-      {
-        int sendIdx   = audioChunkIdx;
-        audioChunkIdx ^= 1;  // swap to other buffer before handing off
-        audioChunkPos  = 0;
-        // Non-blocking send: if the queue is full (send task lagging) the chunk
-        // is intentionally dropped rather than stalling the sampler.
-        xQueueSend(audioSendQ, &sendIdx, 0);
-      }
-    }
+    int sendIdx   = audioChunkIdx;
+    audioChunkIdx ^= 1;  // swap to the other buffer before handing off
+    audioChunkPos  = 0;
+    // Non-blocking: if the send task is lagging, drop the chunk rather than
+    // stalling the timer callback.
+    xQueueSend(audioSendQ, &sendIdx, 0);
   }
-  audioTaskH = nullptr;
-  vTaskDelete(nullptr);
 }
 
 static void startAudioSampling()
@@ -407,16 +378,13 @@ static void startAudioSampling()
   analogSetPinAttenuation(AUDIO_PIN, ADC_11db);
   audioChunkIdx = 0;
   audioChunkPos = 0;
+  audioDcEst    = 128 << 8;  // reset DC estimate for a clean start
 
   // Depth 2: one chunk queued for the send task while the next is filling.
   audioSendQ = xQueueCreate(2, sizeof(int));
-  audioSem   = xSemaphoreCreateBinary();
 
   // Send task: priority 1 (same as loop) so the display loop cannot starve it.
   xTaskCreatePinnedToCore(audioSendTask, "audioSend", 4096, nullptr, 1, &audioSendH, 1);
-
-  // Sampler: priority 1, pinned to core 1, away from WiFi stack on core 0.
-  xTaskCreatePinnedToCore(audioTask, "audioADC", 8192, nullptr, 1, &audioTaskH, 1);
 
   esp_timer_create_args_t args = {};
   args.callback              = audioTimerCB;
@@ -424,8 +392,8 @@ static void startAudioSampling()
   args.name                  = "audioADC";
   args.skip_unhandled_events = true;  // drop missed ticks; never catch up in a burst
   esp_timer_create(&args, &audioTimer);
-  // Fire at AUDIO_SAMPLE_RATE/AUDIO_BATCH Hz (125 Hz, period = 8 ms).
-  esp_timer_start_periodic(audioTimer, 1000000ULL * AUDIO_BATCH / AUDIO_SAMPLE_RATE);
+  // Fire at AUDIO_SAMPLE_RATE Hz (8 kHz, period = 125 µs) – one sample per tick.
+  esp_timer_start_periodic(audioTimer, 1000000ULL / AUDIO_SAMPLE_RATE);
 }
 
 static void stopAudioSampling()
@@ -435,11 +403,6 @@ static void stopAudioSampling()
   esp_timer_delete(audioTimer);
   audioTimer = nullptr;
 
-  // Wake the sampler so it observes audioTimer == nullptr and exits.
-  // Wait up to 200 ms for the task to self-delete.
-  if(audioSem) xSemaphoreGive(audioSem);
-  for(int i = 0; i < 200 && audioTaskH; i++) vTaskDelay(1);
-
   // Send a poison pill to wake and stop the send task.
   if(audioSendQ)
   {
@@ -448,8 +411,7 @@ static void stopAudioSampling()
   }
   for(int i = 0; i < 200 && audioSendH; i++) vTaskDelay(1);
 
-  if(audioSem)  { vSemaphoreDelete(audioSem);  audioSem  = nullptr; }
-  if(audioSendQ){ vQueueDelete(audioSendQ);     audioSendQ = nullptr; }
+  if(audioSendQ){ vQueueDelete(audioSendQ); audioSendQ = nullptr; }
   audioChunkIdx = 0;
   audioChunkPos = 0;
 }
