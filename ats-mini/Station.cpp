@@ -64,11 +64,13 @@ const char *rbdsProgramTypes[32] =
   0, "Weather", "TEST", "! ALERT !"
 };
 
-static char bufStationName[50]   = "";
-static char bufRadioText[100]    = "";
-static char stageRadioText[100]  = "";
-static uint32_t stageRadioTextMs = 0;
-static char bufProgramInfo[100]  = "";
+static char bufStationName[50]    = "";
+static char stageStationName[50]  = "";
+static uint32_t stageStationNameMs = 0;
+static char bufRadioText[100]     = "";
+static char stageRadioText[100]   = "";
+static uint32_t stageRadioTextMs  = 0;
+static char bufProgramInfo[100]   = "";
 static uint16_t piCode = 0x0000;
 
 const char *getStationName()
@@ -97,11 +99,12 @@ uint16_t getRdsPiCode()
 void clearStationInfo()
 {
   bufStationName[0]  = '\0';
+  memset(stageStationName, 0, sizeof(stageStationName));
+  stageStationNameMs = 0;
   bufProgramInfo[0]  = '\0';
   bufRadioText[0]    = '\0'; // Multiline!
   bufRadioText[1]    = '\0';
-  stageRadioText[0]  = '\0'; // Reset staging buffer too
-  stageRadioText[1]  = '\0';
+  memset(stageRadioText, 0, sizeof(stageRadioText));
   stageRadioTextMs   = 0;
   piCode = 0x0000;
 }
@@ -223,6 +226,11 @@ static bool showRdsProgramType(uint8_t pgmType, bool useRBDS = false)
   return(showProgramInfo(text? text:""));
 }
 
+// PS (Program Service) name is 8 chars sent 2 per group 0A (4 groups × ~87 ms = ~350 ms
+// per full cycle).  Hold the staged name for at least 400 ms of stability before
+// committing it to the display buffer.
+#define PS_STABLE_MS 400
+
 // Sanitize and show RDS PS station name: strip non-printable chars and trailing spaces
 static bool showRdsStationName(const char *stationName)
 {
@@ -238,6 +246,22 @@ static bool showRdsStationName(const char *stationName)
   while(d>0 && cleaned[d-1]==' ') d--;
   cleaned[d] = '\0';
 
+  // Has the cleaned name changed since last call?
+  if(strcmp(cleaned, stageStationName) != 0)
+  {
+    // Name is still changing — update stage and reset stability timer.
+    // Do not touch the display buffer yet.
+    strncpy(stageStationName, cleaned, sizeof(stageStationName) - 1);
+    stageStationName[sizeof(stageStationName) - 1] = '\0';
+    stageStationNameMs = millis();
+    return(false);
+  }
+
+  // Name is the same as last call — has it been stable long enough?
+  if((millis() - stageStationNameMs) < PS_STABLE_MS)
+    return(false);
+
+  // Stable for PS_STABLE_MS — commit to display buffer
   return showStationName(cleaned);
 }
 
