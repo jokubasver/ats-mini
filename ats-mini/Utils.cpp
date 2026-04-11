@@ -311,6 +311,8 @@ void dimTickTime()
   }
   else
   {
+    // Linear fade: starts at dimStartBrt (elapsed=0) and decreases to 10 (elapsed=DIM_FADE_MS).
+    // uint32_t subtraction handles millis() rollover correctly.
     int brightness = (int)dimStartBrt - (int)((dimStartBrt - 10) * elapsed / DIM_FADE_MS);
     if(brightness < 10) brightness = 10;
     ledcWrite(PIN_LCD_BL, brightness);
