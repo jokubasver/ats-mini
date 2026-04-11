@@ -1,9 +1,10 @@
 // CW (Morse code) decoder
 //
 // Decodes CW from an audio signal sampled on GPIO11/IO11.
-// Uses the Goertzel algorithm for frequency-selective tone detection at
-// the standard CW sidetone of 700 Hz, rejecting noise and interference
-// at other frequencies.
+// Uses the Goertzel algorithm for frequency-selective tone detection.
+// Six Goertzel bins run in parallel covering 400–900 Hz so that any
+// typical SSB CW sidetone is detected regardless of the exact dial
+// offset, giving ±300 Hz of tolerance around the 700 Hz centre.
 //
 // Requires hardware modification: connect audio IC pin 8 to ESP32 IO11
 // through a lowpass RC filter to remove Class-D PWM switching noise.
@@ -29,24 +30,34 @@
 // -----------------------------------------------------------------------
 //
 // Samples the ADC at CW_SAMPLE_RATE Hz and feeds blocks of CW_GOERTZEL_N
-// samples into the Goertzel algorithm tuned to the target CW tone.
+// samples into CW_NUM_BINS parallel Goertzel filters, each tuned to a
+// different bin within the typical SSB CW audio passband.
 //
-// k = round(N * f_target / f_sample) = round(40 * 700 / 4000) = 7
-// Detected frequency = k * f_sample / N = 7 * 4000 / 40 = 700 Hz exactly
+// Bin spacing = fs / N = 4000 / 40 = 100 Hz
+// Bins k = 4…9 correspond to 400, 500, 600, 700, 800, 900 Hz.
+// This covers the full range of CW sidetones encountered when operating
+// USB/LSB without a precisely set carrier offset.
+//
+// A mark is declared when any single bin's magnitude² exceeds the ON
+// threshold; a space when all bins fall below the OFF threshold.
 //
 // Each block of 40 samples at 4000 Hz covers 10 ms — well below the
 // shortest dit at any practical CW speed.
 
-#define CW_SAMPLE_RATE   4000   // ADC sample rate in Hz
-#define CW_SAMPLE_US      250   // Sample interval in µs (= 1 000 000 / CW_SAMPLE_RATE)
-#define CW_GOERTZEL_N      40   // Samples per Goertzel block
-#define CW_GOERTZEL_K       7   // Bin index → 7 * 4000 / 40 = 700 Hz
+#define CW_SAMPLE_RATE      4000   // ADC sample rate in Hz
+#define CW_SAMPLE_US         250   // Sample interval in µs (= 1 000 000 / CW_SAMPLE_RATE)
+#define CW_GOERTZEL_N         40   // Samples per Goertzel block
+#define CW_GOERTZEL_K_MIN      4   // Lowest bin  → k * fs / N = 4 * 4000 / 40 = 400 Hz
+#define CW_GOERTZEL_K_MAX      9   // Highest bin → k * fs / N = 9 * 4000 / 40 = 900 Hz
+#define CW_NUM_BINS            (CW_GOERTZEL_K_MAX - CW_GOERTZEL_K_MIN + 1)  // 6 bins
 
 // Goertzel magnitude² thresholds for mark/space detection.
-// The Goertzel magnitude² for a pure sine at the target frequency with
+// The Goertzel magnitude² for a pure sine at a bin frequency with
 // ADC amplitude A (12-bit, 0–4095) is approximately (N/2 * A)² = (20*A)².
 // So CW_THRESHOLD_ON²  = 1500² = 2 250 000 corresponds to A ≈ 75 counts.
 //    CW_THRESHOLD_OFF² =  600² =   360 000 corresponds to A ≈ 30 counts.
+// These thresholds apply to each individual bin; a mark is declared when
+// ANY bin exceeds CW_THRESHOLD_ON2.
 // Increase CW_THRESHOLD_ON if noise triggers false decoding;
 // decrease it if weak signals are missed.
 #define CW_THRESHOLD_ON2   (1500.0f * 1500.0f)  // Magnitude² to declare tone present
@@ -149,11 +160,11 @@ static uint32_t cwDitLen = CW_DEFAULT_DIT_MS;  // Adaptive dit estimate (ms)
 // Hysteresis state for mark/space detection
 static bool     cwMarkActive = false;
 
-// Goertzel filter state
-static float    cwGQ1 = 0.0f;          // s[n-1]
-static float    cwGQ2 = 0.0f;          // s[n-2]
+// Goertzel filter state (one entry per bin)
+static float    cwGQ1[CW_NUM_BINS];     // s[n-1] for each bin
+static float    cwGQ2[CW_NUM_BINS];     // s[n-2] for each bin
 static int      cwGCount = 0;           // Sample count in current block
-static float    cwGCoeff = 0.0f;        // 2 * cos(2π * k / N), computed in cwInit()
+static float    cwGCoeff[CW_NUM_BINS];  // 2 * cos(2π * k / N) for each bin, computed in cwInit()
 static uint32_t cwLastSampleUs = 0;     // µs timestamp of last ADC sample
 
 // Long-term DC bias of the ADC input (12-bit, nominally 2048)
@@ -225,8 +236,14 @@ void cwInit(void)
   // Set full 3.3 V range on the CW ADC pin
   analogSetPinAttenuation(CW_ADC_PIN, ADC_11db);
 
-  // Precompute Goertzel coefficient: 2 * cos(2π * k / N)
-  cwGCoeff = 2.0f * cosf(2.0f * (float)M_PI * CW_GOERTZEL_K / (float)CW_GOERTZEL_N);
+  // Precompute Goertzel coefficients: 2 * cos(2π * k / N) for each bin
+  for(int i = 0; i < CW_NUM_BINS; i++)
+  {
+    int k = CW_GOERTZEL_K_MIN + i;
+    cwGCoeff[i] = 2.0f * cosf(2.0f * (float)M_PI * k / (float)CW_GOERTZEL_N);
+    cwGQ1[i]    = 0.0f;
+    cwGQ2[i]    = 0.0f;
+  }
 
   cwState        = CW_IDLE;
   cwStateMs      = millis();
@@ -234,8 +251,6 @@ void cwInit(void)
   cwDitLen       = CW_DEFAULT_DIT_MS;
   cwMarkActive   = false;
   cwDcBias       = 2048;
-  cwGQ1          = 0.0f;
-  cwGQ2          = 0.0f;
   cwGCount       = 0;
   cwLastSampleUs = micros();
   cwTextLen      = 0;
@@ -275,24 +290,33 @@ bool cwTickTime(void)
     cwDcBias += (raw - cwDcBias) >> 8;
     float x = (float)(raw - cwDcBias);
 
-    // Goertzel IIR iteration: s[n] = x[n] + coeff * s[n-1] - s[n-2]
-    float q0 = x + cwGCoeff * cwGQ1 - cwGQ2;
-    cwGQ2 = cwGQ1;
-    cwGQ1 = q0;
+    // Goertzel IIR iteration for each bin: s[n] = x[n] + coeff * s[n-1] - s[n-2]
+    for(int i = 0; i < CW_NUM_BINS; i++)
+    {
+      float q0  = x + cwGCoeff[i] * cwGQ1[i] - cwGQ2[i];
+      cwGQ2[i]  = cwGQ1[i];
+      cwGQ1[i]  = q0;
+    }
 
     if(++cwGCount >= CW_GOERTZEL_N)
     {
-      // Block complete.  Compute |X[k]|² = s²[N-1] + s²[N-2] - coeff * s[N-1] * s[N-2]
-      // Compare against squared thresholds to avoid a sqrtf() call.
-      float mag2 = cwGQ1*cwGQ1 + cwGQ2*cwGQ2 - cwGCoeff * cwGQ1 * cwGQ2;
-
-      // Reset for next block
-      cwGQ1 = cwGQ2 = 0.0f;
+      // Block complete.  Find the maximum magnitude² across all bins.
+      // |X[k]|² = s²[N-1] + s²[N-2] - coeff * s[N-1] * s[N-2]
+      // Compare against squared thresholds to avoid sqrtf().
+      float maxMag2 = 0.0f;
+      for(int i = 0; i < CW_NUM_BINS; i++)
+      {
+        float mag2 = cwGQ1[i]*cwGQ1[i] + cwGQ2[i]*cwGQ2[i]
+                     - cwGCoeff[i] * cwGQ1[i] * cwGQ2[i];
+        if(mag2 > maxMag2) maxMag2 = mag2;
+        cwGQ1[i] = cwGQ2[i] = 0.0f;
+      }
       cwGCount = 0;
 
-      // Update mark/space with hysteresis using magnitude² thresholds
-      if(!cwMarkActive && mag2 > CW_THRESHOLD_ON2)  cwMarkActive = true;
-      if( cwMarkActive && mag2 < CW_THRESHOLD_OFF2) cwMarkActive = false;
+      // Update mark/space with hysteresis using magnitude² thresholds.
+      // A mark fires when ANY bin exceeds the ON threshold.
+      if(!cwMarkActive && maxMag2 > CW_THRESHOLD_ON2)  cwMarkActive = true;
+      if( cwMarkActive && maxMag2 < CW_THRESHOLD_OFF2) cwMarkActive = false;
     }
   }
 
