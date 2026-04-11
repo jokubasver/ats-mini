@@ -21,6 +21,10 @@
 #define AUDIO_PIN          11    // GPIO11 – ADC input from NS4160 pin 8 via RC filter
 #define AUDIO_SAMPLE_RATE  8000  // 8 kHz sample rate
 #define AUDIO_CHUNK_SIZE   512   // Samples per WebSocket message (64 ms at 8 kHz)
+#define AUDIO_BATCH        16    // Output samples collected per timer tick; timer fires at
+                                 // AUDIO_SAMPLE_RATE/AUDIO_BATCH Hz (500 Hz) instead of
+                                 // AUDIO_SAMPLE_RATE Hz (8000 Hz), cutting context switches
+                                 // on core 1 by 16× and keeping the display responsive.
 
 static uint8_t            audioChunk[2][AUDIO_CHUNK_SIZE]; // double buffer
 static volatile int       audioChunkIdx = 0;               // active write buffer
@@ -318,7 +322,7 @@ static bool wifiConnect()
 }
 
 //
-// Audio timer callback – fires at AUDIO_SAMPLE_RATE Hz.
+// Audio timer callback – fires at AUDIO_SAMPLE_RATE/AUDIO_BATCH Hz (500 Hz).
 // Uses ESP_TIMER_TASK dispatch (the only option available in arduino core
 // 3.3.7 / ESP-IDF 5.1).  The callback runs in a task context, not an ISR,
 // so the regular (non-ISR) semaphore API must be used.  It does no heavy
@@ -333,23 +337,30 @@ static void audioTimerCB(void *)
 
 //
 // Audio sampling task – runs on core 1 (Arduino's core, away from WiFi).
-// Wakes on each semaphore give, reads ADC, fills the double buffer, and
-// sends completed chunks via WebSocket.
+// Wakes on each semaphore give (AUDIO_SAMPLE_RATE/AUDIO_BATCH times per
+// second), then collects AUDIO_BATCH output samples per wakeup.  Each
+// output sample is the average of two consecutive ADC reads (2× oversampling)
+// to reduce ADC noise without extra bandwidth.
 //
 static void audioTask(void *)
 {
   while(xSemaphoreTake(audioSem, portMAX_DELAY) == pdTRUE)
   {
     if(!audioTimer) break;  // stop signal
-    uint16_t raw = analogRead(AUDIO_PIN);
-    audioChunk[audioChunkIdx][audioChunkPos++] = (uint8_t)(raw >> 4);
-    if(audioChunkPos >= AUDIO_CHUNK_SIZE)
+    for(int i = 0; i < AUDIO_BATCH; i++)
     {
-      int sendIdx   = audioChunkIdx;
-      audioChunkIdx ^= 1;  // swap to other buffer before sending
-      audioChunkPos  = 0;
-      if(audioWS.count() > 0)
-        audioWS.binaryAll(audioChunk[sendIdx], AUDIO_CHUNK_SIZE);
+      // 2× oversampling: average two consecutive 12-bit reads, then scale to 8-bit.
+      // sum of two 12-bit reads (0–8190) >> 5 == (sum/2) >> 4 → 8-bit unsigned PCM.
+      uint32_t raw = (uint32_t)analogRead(AUDIO_PIN) + analogRead(AUDIO_PIN);
+      audioChunk[audioChunkIdx][audioChunkPos++] = (uint8_t)(raw >> 5);
+      if(audioChunkPos >= AUDIO_CHUNK_SIZE)
+      {
+        int sendIdx   = audioChunkIdx;
+        audioChunkIdx ^= 1;  // swap to other buffer before sending
+        audioChunkPos  = 0;
+        if(audioWS.count() > 0)
+          audioWS.binaryAll(audioChunk[sendIdx], AUDIO_CHUNK_SIZE);
+      }
     }
   }
   audioTaskH = nullptr;
@@ -366,9 +377,10 @@ static void startAudioSampling()
   audioSem = xSemaphoreCreateBinary();
 
   // Pin audio task to core 1 (Arduino loop core) so it doesn't compete
-  // with the WiFi stack which runs on core 0.  Stack must be large enough
-  // for analogRead()'s deep HAL call chain plus binaryAll()'s AsyncTCP layers.
-  xTaskCreatePinnedToCore(audioTask, "audioADC", 8192, nullptr, 2, &audioTaskH, 1);
+  // with the WiFi stack which runs on core 0.  Priority 1 (same as loop)
+  // lets it timeslice with the display rather than preempting it.  Stack
+  // must be large enough for analogRead()'s deep HAL chain plus binaryAll().
+  xTaskCreatePinnedToCore(audioTask, "audioADC", 8192, nullptr, 1, &audioTaskH, 1);
 
   esp_timer_create_args_t args = {};
   args.callback              = audioTimerCB;
@@ -376,7 +388,9 @@ static void startAudioSampling()
   args.name                  = "audioADC";
   args.skip_unhandled_events = true;
   esp_timer_create(&args, &audioTimer);
-  esp_timer_start_periodic(audioTimer, 1000000ULL / AUDIO_SAMPLE_RATE);
+  // Fire at AUDIO_SAMPLE_RATE/AUDIO_BATCH Hz so the task wakes in bursts
+  // rather than once per sample, cutting context switches 16×.
+  esp_timer_start_periodic(audioTimer, 1000000ULL * AUDIO_BATCH / AUDIO_SAMPLE_RATE);
 }
 
 static void stopAudioSampling()
