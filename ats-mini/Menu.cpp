@@ -657,6 +657,8 @@ static void doDecoderMode(int16_t enc)
   uint8_t newIdx = wrap_range(decoderModeIdx, enc, 0, LAST_ITEM(decoderModeDesc));
   // Clear any accumulated decoded text when turning the decoder off
   if(newIdx == DECODER_OFF) clearCwText();
+  // Start the CW sampler task/timer the first time CW mode is selected
+  if(newIdx == DECODER_CW && decoderModeIdx != DECODER_CW) cwInit();
   decoderModeIdx = newIdx;
 }
 

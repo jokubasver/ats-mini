@@ -16,7 +16,6 @@
 
 #include "Common.h"
 #include "CW.h"
-#include <esp_timer.h>
 #include <freertos/semphr.h>
 #include <math.h>
 
@@ -202,23 +201,16 @@ static volatile int16_t cwRingBuf[CW_RING_SIZE];
 static volatile uint8_t cwRingWrite = 0;  // Written by sampler task
 static volatile uint8_t cwRingRead  = 0;  // Written by cwTickTime()
 
-static esp_timer_handle_t cwSampleTimer   = NULL;
-static TaskHandle_t       cwSamplerHandle = NULL;
-static SemaphoreHandle_t  cwSampleSem     = NULL;
+static hw_timer_t      *cwSampleTimer   = NULL;
+static TaskHandle_t     cwSamplerHandle = NULL;
+static SemaphoreHandle_t cwSampleSem    = NULL;
 
-// Timer callback: runs directly in the hardware timer ISR (ESP_TIMER_ISR
-// dispatch).  This avoids waking the esp_timer service task (FreeRTOS
-// priority 22) on every tick.  With ESP_TIMER_TASK dispatch at 4 kHz the
-// service task was being woken 4000×/s on core 0, competing with the
-// WiFi/BLE controller tasks at comparable priorities and starving them long
-// enough to trigger their internal watchdog (~500 ms timeout) — the root
-// cause of the boot loop.
-//
-// The ISR itself is < 2 µs; it simply signals the lower-priority sampler
-// task which then calls analogRead() safely in task context.
-static void IRAM_ATTR cwTimerCallback(void * /*arg*/)
+// Hardware timer ISR: fires at CW_SAMPLE_RATE Hz.
+// Runs in hardware interrupt context — no FreeRTOS task involvement, so it
+// cannot starve the WiFi/BLE scheduler.  Simply signals the sampler task via
+// a binary semaphore and requests a context switch if the task becomes ready.
+static void IRAM_ATTR cwTimerISR(void)
 {
-  if(!cwSampleSem) return;
   BaseType_t woken = pdFALSE;
   xSemaphoreGiveFromISR(cwSampleSem, &woken);
   if(woken) portYIELD_FROM_ISR();
@@ -336,8 +328,7 @@ void cwInit(void)
   // Stop and clean up any resources left over from a previous cwInit() call.
   if(cwSampleTimer != NULL)
   {
-    esp_timer_stop(cwSampleTimer);
-    esp_timer_delete(cwSampleTimer);
+    timerEnd(cwSampleTimer);
     cwSampleTimer = NULL;
   }
   if(cwSamplerHandle != NULL)
@@ -351,7 +342,7 @@ void cwInit(void)
     cwSampleSem = NULL;
   }
 
-  // Create the binary semaphore used by the timer to wake the sampler task.
+  // Create the binary semaphore used by the ISR to wake the sampler task.
   cwSampleSem = xSemaphoreCreateBinary();
   if(cwSampleSem == NULL) return;
 
@@ -369,21 +360,24 @@ void cwInit(void)
     return;
   }
 
-  // Create and start the 4 kHz periodic timer that wakes the sampler task.
-  // ESP_TIMER_ISR dispatch: the callback runs directly from the hardware
-  // timer ISR (not via the esp_timer service task) so it completes in ~2 µs
-  // and never involves the priority-22 esp_timer FreeRTOS task.
-  const esp_timer_create_args_t timerArgs =
+  // Create and start the 4 kHz hardware timer that wakes the sampler task.
+  // timerBegin(1000000) creates a 1 MHz counter; timerAlarm fires every
+  // CW_SAMPLE_US (250) counts = 250 µs = 4 kHz.
+  // The ISR runs in hardware interrupt context — no FreeRTOS service task is
+  // involved, so it cannot interfere with WiFi/BLE scheduler tasks.
+  cwSampleTimer = timerBegin(1000000);
+  if(cwSampleTimer != NULL)
   {
-    .callback              = cwTimerCallback,
-    .arg                   = NULL,
-    .dispatch_method       = ESP_TIMER_ISR,
-    .name                  = "cw_sample",
-    .skip_unhandled_events = true,
-  };
-
-  if(esp_timer_create(&timerArgs, &cwSampleTimer) == ESP_OK)
-    esp_timer_start_periodic(cwSampleTimer, CW_SAMPLE_US);
+    timerAttachInterrupt(cwSampleTimer, cwTimerISR);
+    timerAlarm(cwSampleTimer, CW_SAMPLE_US, true, 0);
+  }
+  else
+  {
+    vTaskDelete(cwSamplerHandle);
+    cwSamplerHandle = NULL;
+    vSemaphoreDelete(cwSampleSem);
+    cwSampleSem = NULL;
+  }
 }
 
 // Called every main-loop iteration.  Returns true when the decoded text

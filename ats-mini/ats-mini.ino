@@ -257,8 +257,12 @@ void setup()
   rx.setVolume(volume);
   rx.setMaxSeekTime(SEEK_TIMEOUT);
 
-  // Initialize CW decoder
-  cwInit();
+  // Initialize CW decoder — only create the sampler task and hardware timer
+  // when CW mode is actually selected.  Running the task unconditionally was
+  // the root cause of the boot loop: a priority-2 task calling analogRead()
+  // 4000×/s starved the Arduino loop task and triggered the TWDT.
+  if(decoderModeIdx == DECODER_CW)
+    cwInit();
 
   // Draw display for the first time
   drawScreen();
