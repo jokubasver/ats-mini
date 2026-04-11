@@ -320,7 +320,7 @@ static bool wifiConnect()
 }
 
 //
-// Audio send task – runs on core 1 at FreeRTOS priority 1 (same as loop).
+// Audio send task – runs on core 1 at FreeRTOS priority 2 (same as sampler, above loop).
 // Receives completed chunk indices from the sampling task via a queue and
 // sends them over the WebSocket.  Keeping the potentially-slow binaryAll() here
 // prevents any TCP-stack stall from blocking the sampling task.
@@ -340,18 +340,14 @@ static void audioSendTask(void *)
 
 //
 // Audio timer callback – fires at AUDIO_SAMPLE_RATE Hz (8 kHz, period = 125 µs).
-// Runs as a hardware timer ISR (ESP_TIMER_ISR dispatch) so it fires at the
-// exact hardware tick without any esp_timer-task scheduling delay.  It only
-// wakes the sampling task via an ISR-safe direct-to-task notification.
-// portYIELD_FROM_ISR triggers an immediate context switch to audioTask if it
-// was the highest-priority ready task.
+// Runs in the esp_timer task (high priority).  It only wakes the sampling task
+// via a direct-to-task notification – no ADC read, no memory writes.  Keeping
+// the callback as short as possible prevents it from starving the idle task and
+// triggering the Task Watchdog Timer (TWDT).
 //
-static void IRAM_ATTR audioTimerCB(void *)
+static void audioTimerCB(void *)
 {
-  if(!audioTaskH) return;
-  BaseType_t woken = pdFALSE;
-  vTaskNotifyGiveFromISR(audioTaskH, &woken);
-  portYIELD_FROM_ISR(woken);
+  if(audioTaskH) xTaskNotifyGive(audioTaskH);
 }
 
 //
@@ -420,7 +416,7 @@ static void startAudioSampling()
 
   esp_timer_create_args_t args = {};
   args.callback              = audioTimerCB;
-  args.dispatch_method       = ESP_TIMER_ISR;   // ISR context: fires at exact hw tick, no task-scheduling jitter
+  args.dispatch_method       = ESP_TIMER_TASK;  // ESP_TIMER_ISR not available in esp32 Arduino core 3.x
   args.name                  = "audioADC";
   args.skip_unhandled_events = true;  // drop missed ticks; never catch up in a burst
   esp_timer_create(&args, &audioTimer);
