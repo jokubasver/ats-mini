@@ -14,6 +14,7 @@
 #include "EIBI.h"
 #include "Remote.h"
 #include "Ble.h"
+#include "CW.h"
 
 // SI473/5 and UI
 #define MIN_ELAPSED_TIME         5  // 300
@@ -255,6 +256,9 @@ void setup()
   delay(50);
   rx.setVolume(volume);
   rx.setMaxSeekTime(SEEK_TIMEOUT);
+
+  // Initialize CW decoder
+  cwInit();
 
   // Draw display for the first time
   drawScreen();
@@ -978,6 +982,10 @@ void loop()
     needRedraw |= (currentMode == FM) && (snr >= 12) && checkRds();
     lastRDSCheck = currentTime;
   }
+
+  // Process CW (Morse code) decoding from audio ADC input (AM/SSB modes only)
+  if(currentMode != FM)
+    needRedraw |= cwTickTime();
 
   // Periodically check schedule
   if((currentTime - lastScheduleCheck) > SCHEDULE_CHECK_TIME)

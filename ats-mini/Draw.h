@@ -48,6 +48,7 @@ void drawSMeter(int strength, int x, int y);
 void drawStereoIndicator(int x, int y, bool stereo = true);
 bool drawWiFiStatus(const char *statusLine1, const char *statusLine2, int x, int y);
 void drawRadioText(int y, int ymax);
+void drawCwText(int x, int y);
 void drawScale(uint32_t freq);
 
 void drawLayoutDefault(const char *statusLine1, const char *statusLine2);

@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "Themes.h"
 #include "Menu.h"
+#include "CW.h"
 #include "Draw.h"
 
 static int getInterpolatedStrength(int rssi)
@@ -211,9 +212,11 @@ void drawLayoutSmeter(const char *statusLine1, const char *statusLine2)
   }
   else if(!drawWiFiStatus(statusLine1, statusLine2, STATUS_OFFSET_X, STATUS_OFFSET_Y))
   {
-    // Show radio text if present, else show S & SN meters
+    // Show radio text if present, else CW text (in AM/SSB modes), else S & SN meters
     if(*getRadioText() || *getProgramInfo())
       drawRadioText(STATUS_OFFSET_Y, STATUS_OFFSET_Y + 25);
+    else if(currentMode != FM && *getCwText())
+      drawCwText(STATUS_OFFSET_X, STATUS_OFFSET_Y);
     else
     {
       // Draw SN-meter

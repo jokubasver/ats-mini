@@ -4,6 +4,7 @@
 #include "Utils.h"
 #include "Menu.h"
 #include "Ble.h"
+#include "CW.h"
 #include "Draw.h"
 
 //
@@ -143,6 +144,25 @@ void drawRadioText(int y, int ymax)
   // Show program info if we have it and there is enough space
   if((y<ymax) && *getProgramInfo())
     spr.drawString(getProgramInfo(), 160, y, 2);
+}
+
+//
+// Draw decoded CW (Morse code) text in the status area.
+// Shows the most recent characters that fit on one line.
+//
+void drawCwText(int x, int y)
+{
+  const char *text = getCwText();
+  if(!text || !*text) return;
+
+  // Show at most this many characters (fits comfortably in font-2 on 320px wide screen)
+  const int MAX_DISPLAY_CHARS = 22;
+  int len = (int)strlen(text);
+  const char *display = (len > MAX_DISPLAY_CHARS) ? text + len - MAX_DISPLAY_CHARS : text;
+
+  spr.setTextDatum(TC_DATUM);
+  spr.setTextColor(TH.rds_text);
+  spr.drawString(display, x, y, 2);
 }
 
 //
