@@ -42,19 +42,21 @@
 #define CW_GOERTZEL_N      40   // Samples per Goertzel block
 #define CW_GOERTZEL_K       7   // Bin index → 7 * 4000 / 40 = 700 Hz
 
-// Goertzel magnitude thresholds for mark/space detection.
-// For a pure sine at the target frequency with ADC amplitude A:
-//   magnitude ≈ N/2 * A = 20 * A
-// So CW_THRESHOLD_ON  = 1500 corresponds to A ≈ 75 ADC counts (of 0–4095).
-//    CW_THRESHOLD_OFF =  600 corresponds to A ≈ 30 ADC counts.
+// Goertzel magnitude² thresholds for mark/space detection.
+// The Goertzel magnitude² for a pure sine at the target frequency with
+// ADC amplitude A (12-bit, 0–4095) is approximately (N/2 * A)² = (20*A)².
+// So CW_THRESHOLD_ON²  = 1500² = 2 250 000 corresponds to A ≈ 75 counts.
+//    CW_THRESHOLD_OFF² =  600² =   360 000 corresponds to A ≈ 30 counts.
 // Increase CW_THRESHOLD_ON if noise triggers false decoding;
 // decrease it if weak signals are missed.
-#define CW_THRESHOLD_ON   1500.0f  // Magnitude to declare tone present
-#define CW_THRESHOLD_OFF   600.0f  // Magnitude to declare tone absent
+#define CW_THRESHOLD_ON2   (1500.0f * 1500.0f)  // Magnitude² to declare tone present
+#define CW_THRESHOLD_OFF2   (600.0f *  600.0f)  // Magnitude² to declare tone absent
 
 // Timing parameters
 #define CW_MIN_MARK_MS    10   // Minimum mark duration — rejects short noise spikes
 #define CW_SILENCE_MS   3000   // Silence duration after which decoder resets to idle
+#define CW_MIN_DIT_MS     20   // Minimum adaptive dit length (≈ 60 WPM)
+#define CW_MAX_DIT_MS    500   // Maximum adaptive dit length (≈ 2.4 WPM)
 
 // Initial dit-length estimate in milliseconds (15 WPM ≈ 80 ms/dit)
 #define CW_DEFAULT_DIT_MS  80
@@ -152,7 +154,6 @@ static float    cwGQ1 = 0.0f;          // s[n-1]
 static float    cwGQ2 = 0.0f;          // s[n-2]
 static int      cwGCount = 0;           // Sample count in current block
 static float    cwGCoeff = 0.0f;        // 2 * cos(2π * k / N), computed in cwInit()
-static float    cwEnvelope = 0.0f;      // Latest Goertzel magnitude
 static uint32_t cwLastSampleUs = 0;     // µs timestamp of last ADC sample
 
 // Long-term DC bias of the ADC input (12-bit, nominally 2048)
@@ -236,7 +237,6 @@ void cwInit(void)
   cwGQ1          = 0.0f;
   cwGQ2          = 0.0f;
   cwGCount       = 0;
-  cwEnvelope     = 0.0f;
   cwLastSampleUs = micros();
   cwTextLen      = 0;
   cwText[0]      = '\0';
@@ -257,15 +257,20 @@ bool cwTickTime(void)
   // updates cwMarkActive with hysteresis.
   // -----------------------------------------------------------------------
   uint32_t nowUs = micros();
-  if(nowUs - cwLastSampleUs >= (uint32_t)CW_SAMPLE_US)
+  uint32_t elapsed = nowUs - cwLastSampleUs;
+  if(elapsed >= (uint32_t)CW_SAMPLE_US)
   {
     // Advance timestamp by one period; if we've fallen more than one period
     // behind (e.g. after a long redraw), resync to avoid a burst of samples.
-    cwLastSampleUs += CW_SAMPLE_US;
-    if(nowUs - cwLastSampleUs >= (uint32_t)CW_SAMPLE_US)
+    if(elapsed >= 2u * (uint32_t)CW_SAMPLE_US)
       cwLastSampleUs = nowUs;
+    else
+      cwLastSampleUs += CW_SAMPLE_US;
 
-    // Read ADC and remove slowly-tracked DC offset (α ≈ 1/256, τ ≈ 64 ms)
+    // Read ADC and remove slowly-tracked DC offset.
+    // The ESP32-S3 ADC is 12-bit (0–4095); cwDcBias is initialised to 2048.
+    // α = 1/256 gives a time constant of ~256 samples = 64 ms at 4 kHz,
+    // long enough to track slow DC drift without following the audio signal.
     int32_t raw = analogRead(CW_ADC_PIN);
     cwDcBias += (raw - cwDcBias) >> 8;
     float x = (float)(raw - cwDcBias);
@@ -278,16 +283,16 @@ bool cwTickTime(void)
     if(++cwGCount >= CW_GOERTZEL_N)
     {
       // Block complete.  Compute |X[k]|² = s²[N-1] + s²[N-2] - coeff * s[N-1] * s[N-2]
+      // Compare against squared thresholds to avoid a sqrtf() call.
       float mag2 = cwGQ1*cwGQ1 + cwGQ2*cwGQ2 - cwGCoeff * cwGQ1 * cwGQ2;
-      cwEnvelope = sqrtf(fabsf(mag2));
 
       // Reset for next block
       cwGQ1 = cwGQ2 = 0.0f;
       cwGCount = 0;
 
-      // Update mark/space with hysteresis
-      if(!cwMarkActive && cwEnvelope > CW_THRESHOLD_ON)  cwMarkActive = true;
-      if( cwMarkActive && cwEnvelope < CW_THRESHOLD_OFF) cwMarkActive = false;
+      // Update mark/space with hysteresis using magnitude² thresholds
+      if(!cwMarkActive && mag2 > CW_THRESHOLD_ON2)  cwMarkActive = true;
+      if( cwMarkActive && mag2 < CW_THRESHOLD_OFF2) cwMarkActive = false;
     }
   }
 
@@ -333,9 +338,9 @@ bool cwTickTime(void)
             cwDitLen = (cwDitLen * 3 + dur / 3) / 4;
           }
 
-          // Clamp to [20 ms, 500 ms]  ≈  60 WPM … 2.4 WPM
-          if(cwDitLen < 20)  cwDitLen = 20;
-          if(cwDitLen > 500) cwDitLen = 500;
+          // Clamp to [CW_MIN_DIT_MS, CW_MAX_DIT_MS]
+          if(cwDitLen < CW_MIN_DIT_MS) cwDitLen = CW_MIN_DIT_MS;
+          if(cwDitLen > CW_MAX_DIT_MS) cwDitLen = CW_MAX_DIT_MS;
         }
 
         cwState   = CW_SPACE;
