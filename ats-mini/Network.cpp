@@ -712,43 +712,44 @@ static const String webAudioPage()
 "<TR><TD CLASS='CENTER' ID='st'>Press Start to listen</TD></TR>"
 "</TABLE>"
 "<SCRIPT>"
-// Ring-buffer + ScriptProcessorNode approach.
-// A single ScriptProcessorNode pulls samples continuously from an 8192-sample
-// (1-second) ring buffer, eliminating the per-chunk AudioBufferSource boundary
-// clicks (~15 Hz ticking) that the previous approach produced.  The ring buffer
-// also absorbs short-term network jitter without gaps.  Playback starts only
-// after FILL samples have accumulated (200 ms pre-buffer), ensuring a smooth
-// start even over slower WiFi.
-"var ctx=null,ws=null,proc=null;"
-"var RING=8192,FILL=1600,ring=new Float32Array(8192),wp=0,rp=0,playing=false;"
-"function avail(){return(wp-rp+RING)&(RING-1);}"
+// AudioBufferSourceNode approach – each incoming chunk is decoded into a
+// Float32 AudioBuffer and scheduled to start exactly where the previous one
+// ended via the 'npt' (next-play-time) cursor.  Because AudioBufferSourceNode
+// is driven by the browser's dedicated real-time audio thread (not the JS main
+// thread), pitch and timing are always correct regardless of main-thread load.
+// The DC-blocking filter on the firmware side keeps every chunk centred at
+// mid-scale, so there are no level discontinuities at buffer boundaries and
+// therefore no audible clicks between chunks.
+// JITTER: initial pre-buffer (seconds).  The first chunk is scheduled 300 ms
+// ahead of ctx.currentTime to absorb WiFi jitter.  The same value is used as
+// a recovery gap if a chunk arrives late (npt has already passed).
+"var ctx=null,ws=null,npt=0,JITTER=0.3;"
 "function startAudio(){"
   "if(ws)return;"
   "if(!ctx||ctx.state==='closed')ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:8000});"
   "ctx.resume();"
-  "proc=ctx.createScriptProcessor(512,1,1);"
-  "proc.onaudioprocess=function(e){"
-    "var out=e.outputBuffer.getChannelData(0),av=avail();"
-    "if(!playing&&av>=FILL)playing=true;"
-    "for(var i=0;i<out.length;i++){"
-      "if(playing&&av>0){out[i]=ring[rp];rp=(rp+1)&(RING-1);av--;}"
-      "else{out[i]=0;if(playing)playing=false;}"
-    "}"
-  "};"
-  "proc.connect(ctx.destination);"
-  "wp=0;rp=0;playing=false;"
   "ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/audiows');"
   "ws.binaryType='arraybuffer';"
   "ws.onopen=function(){"
     "if(ctx&&ctx.state==='suspended')ctx.resume();"
+    "npt=0;"
     "document.getElementById('st').textContent='Streaming...';"
   "};"
   "ws.onmessage=function(e){"
+    "if(!ctx||ctx.state==='closed')return;"
     "var b=new Uint8Array(e.data);"
-    "for(var i=0;i<b.length;i++){var nx=(wp+1)&(RING-1);if(nx!==rp){ring[wp]=b[i]/128.0-1.0;wp=nx;}}"
+    "var a=ctx.createBuffer(1,b.length,8000);"
+    "var d=a.getChannelData(0);"
+    "for(var i=0;i<b.length;i++)d[i]=b[i]/128.0-1.0;"
+    "var s=ctx.createBufferSource();"
+    "s.buffer=a;s.connect(ctx.destination);"
+    // Schedule: if npt is in the past (late chunk or first chunk) add JITTER
+    // to give the audio thread time to prepare; otherwise chain immediately.
+    "var n=ctx.currentTime;if(npt<n+0.005)npt=n+JITTER;"
+    "s.start(npt);npt+=b.length/8000;"
   "};"
   "ws.onclose=function(){"
-    "ws=null;playing=false;"
+    "ws=null;npt=0;"
     "document.getElementById('sta').disabled=false;"
     "document.getElementById('sto').disabled=true;"
     "document.getElementById('st').textContent='Disconnected - click Start to retry';"
@@ -758,9 +759,8 @@ static const String webAudioPage()
 "}"
 "function stopAudio(){"
   "if(ws){ws.onclose=null;ws.close();ws=null;}"
-  "if(proc){proc.disconnect();proc=null;}"
   "if(ctx){ctx.close();ctx=null;}"
-  "wp=0;rp=0;playing=false;"
+  "npt=0;"
   "document.getElementById('sta').disabled=false;"
   "document.getElementById('sto').disabled=true;"
   "document.getElementById('st').textContent='Stopped';"
