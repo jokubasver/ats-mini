@@ -365,8 +365,8 @@ static bool IRAM_ATTR adcConvDoneCB(adc_continuous_handle_t handle,
 
   for(uint32_t i = 0; i < count; i++)
   {
-    // Skip invalid results or results from an unexpected channel.
-    if(p[i].type2.flag || p[i].type2.channel != AUDIO_ADC_CHANNEL) continue;
+    // Skip results from an unexpected channel.
+    if(p[i].type2.channel != AUDIO_ADC_CHANNEL) continue;
 
     uint8_t raw = (uint8_t)(p[i].type2.data >> 4);  // 12-bit → 8-bit unsigned
 
