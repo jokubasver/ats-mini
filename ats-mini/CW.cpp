@@ -17,6 +17,7 @@
 #include "Common.h"
 #include "CW.h"
 #include <esp_timer.h>
+#include <freertos/semphr.h>
 #include <math.h>
 
 // Morse binary tree table size (covers up to 5-element codes)
@@ -61,14 +62,17 @@
 // Goertzel magnitude² thresholds for mark/space detection.
 // The Goertzel magnitude² for a pure sine at a bin frequency with
 // ADC amplitude A (12-bit, 0–4095) is approximately (N/2 * A)² = (20*A)².
-// So CW_THRESHOLD_ON²  = 1000² = 1 000 000 corresponds to A ≈ 50 counts (≈ 40 mV peak).
-//    CW_THRESHOLD_OFF² =  400² =   160 000 corresponds to A ≈ 20 counts (≈ 16 mV peak).
+// So CW_THRESHOLD_ON²  =  800² =   640 000 corresponds to A ≈ 40 counts (≈ 32 mV peak).
+//    CW_THRESHOLD_OFF² =  320² =   102 400 corresponds to A ≈ 16 counts (≈ 13 mV peak).
 // These thresholds apply to each individual bin; a mark is declared when
 // ANY bin exceeds CW_THRESHOLD_ON2.
+// The ON threshold is set slightly lower than 1000² to improve sensitivity
+// for tones that fall between bin centres (worst-case inter-bin response is
+// ~64 % of peak magnitude²).
 // Increase CW_THRESHOLD_ON if noise triggers false decoding;
 // decrease it if weak signals are missed.
-#define CW_THRESHOLD_ON2   (1000.0f * 1000.0f)  // Magnitude² to declare tone present
-#define CW_THRESHOLD_OFF2   (400.0f *  400.0f)  // Magnitude² to declare tone absent
+#define CW_THRESHOLD_ON2   (800.0f * 800.0f)  // Magnitude² to declare tone present
+#define CW_THRESHOLD_OFF2  (320.0f * 320.0f)  // Magnitude² to declare tone absent
 
 // Timing parameters
 #define CW_MIN_MARK_MS    10   // Minimum mark duration — rejects short noise spikes
@@ -77,7 +81,12 @@
 #define CW_MAX_DIT_MS    500   // Maximum adaptive dit length (≈ 2.4 WPM)
 
 // Initial dit-length estimate in milliseconds (15 WPM ≈ 80 ms/dit)
-#define CW_DEFAULT_DIT_MS  80
+#define CW_DEFAULT_DIT_MS   80
+
+// After this many milliseconds of continuous silence the dit-length estimate
+// is reset to the default so that a speed change is not penalised by a stale
+// estimate from a previous transmission.
+#define CW_DIT_RESET_MS  10000
 
 // Morse code binary tree
 // Navigate from the root (index 1) using:
@@ -181,30 +190,50 @@ static char    cwText[CW_TEXT_LEN + 1] = "";
 static uint8_t cwTextLen = 0;
 
 // -----------------------------------------------------------------------
-// ADC ring buffer — written by the esp_timer callback, read by cwTickTime()
+// ADC ring buffer — written by the sampler task, read by cwTickTime()
 // -----------------------------------------------------------------------
-// The esp_timer fires every CW_SAMPLE_US (250 µs) and pushes one ADC
-// sample.  cwTickTime() drains all available samples each main-loop call.
+// A low-priority FreeRTOS sampler task (priority 2) reads one ADC sample
+// per timer period and pushes it here.  cwTickTime() drains all available
+// samples each main-loop call.
 // Indices are uint8_t so modular arithmetic wraps naturally at 256; the
 // effective buffer length is CW_RING_SIZE (a power of 2).
 
 static volatile int16_t cwRingBuf[CW_RING_SIZE];
-static volatile uint8_t cwRingWrite = 0;  // Written by timer callback
+static volatile uint8_t cwRingWrite = 0;  // Written by sampler task
 static volatile uint8_t cwRingRead  = 0;  // Written by cwTickTime()
 
-static esp_timer_handle_t cwSampleTimer = NULL;
+static esp_timer_handle_t cwSampleTimer   = NULL;
+static TaskHandle_t       cwSamplerHandle = NULL;
+static SemaphoreHandle_t  cwSampleSem     = NULL;
 
-// Timer callback: called by the esp_timer task at exactly CW_SAMPLE_RATE Hz.
-// Reads one ADC sample and pushes it into the ring buffer.  If the buffer
-// is full (cwTickTime() is not keeping up), the sample is dropped.
-static void cwSampleCallback(void * /*arg*/)
+// Timer callback: runs in the esp_timer service task (high-priority FreeRTOS
+// task).  Signals the sampler task via a binary semaphore — does NOT call
+// analogRead() here.  Calling analogRead() from a high-priority task can
+// cause priority inversion if the Arduino ADC mutex is held by a lower-
+// priority task (e.g. battery monitor), which would starve the main loop
+// and freeze both the UI and the CW decoder.
+static void cwTimerCallback(void * /*arg*/)
 {
-  int16_t raw = (int16_t)analogRead(CW_ADC_PIN);
-  uint8_t next = (cwRingWrite + 1) & (CW_RING_SIZE - 1);
-  if(next != cwRingRead)
+  if(cwSampleSem) xSemaphoreGive(cwSampleSem);
+}
+
+// Sampler task (priority 2 — just above the main Arduino loop at priority 1).
+// Wakes whenever the timer signals the semaphore, reads one ADC sample, and
+// pushes it into the ring buffer.  Because this task has higher priority than
+// the main loop it preempts it for the ~20 µs needed by analogRead() and then
+// immediately yields back, giving the main loop ~92 % of CPU time.
+static void cwSamplerTaskFn(void * /*arg*/)
+{
+  for(;;)
   {
-    cwRingBuf[cwRingWrite] = raw;
-    cwRingWrite = next;
+    xSemaphoreTake(cwSampleSem, portMAX_DELAY);
+    int16_t raw = (int16_t)analogRead(CW_ADC_PIN);
+    uint8_t next = (cwRingWrite + 1) & (CW_RING_SIZE - 1);
+    if(next != cwRingRead)
+    {
+      cwRingBuf[cwRingWrite] = raw;
+      cwRingWrite = next;
+    }
   }
 }
 
@@ -267,8 +296,12 @@ static bool cwDecodeChar(void)
 
 void cwInit(void)
 {
-  // Set full 3.3 V range on the CW ADC pin
+  // Configure the ADC pin and perform a warm-up read so that the ADC
+  // subsystem is fully initialised before the timer starts.  This prevents
+  // the first timer-triggered sample from incurring the one-time setup cost
+  // inside analogRead() while the high-priority timer task is running.
   analogSetPinAttenuation(CW_ADC_PIN, ADC_11db);
+  analogRead(CW_ADC_PIN);
 
   // Precompute Goertzel coefficients: 2 * cos(2π * k / N) for each bin
   for(int i = 0; i < CW_NUM_BINS; i++)
@@ -293,21 +326,44 @@ void cwInit(void)
   // Reset ring buffer
   cwRingWrite = cwRingRead = 0;
 
-  // Start (or restart) the 4 kHz ADC sampling timer.
-  // Stop and delete any previously running timer first.
+  // Stop and clean up any resources left over from a previous cwInit() call.
   if(cwSampleTimer != NULL)
   {
     esp_timer_stop(cwSampleTimer);
     esp_timer_delete(cwSampleTimer);
     cwSampleTimer = NULL;
   }
+  if(cwSamplerHandle != NULL)
+  {
+    vTaskDelete(cwSamplerHandle);
+    cwSamplerHandle = NULL;
+  }
+  if(cwSampleSem != NULL)
+  {
+    vSemaphoreDelete(cwSampleSem);
+    cwSampleSem = NULL;
+  }
 
+  // Create the binary semaphore used by the timer to wake the sampler task.
+  cwSampleSem = xSemaphoreCreateBinary();
+  if(cwSampleSem == NULL) return;
+
+  // Create the ADC sampler task at priority 2 (above the main loop at 1).
+  if(xTaskCreate(cwSamplerTaskFn, "cw_smpl", 2048, NULL, 2, &cwSamplerHandle) != pdPASS)
+  {
+    cwSamplerHandle = NULL;
+    vSemaphoreDelete(cwSampleSem);
+    cwSampleSem = NULL;
+    return;
+  }
+
+  // Create and start the 4 kHz periodic timer that wakes the sampler task.
   const esp_timer_create_args_t timerArgs =
   {
-    .callback             = cwSampleCallback,
-    .arg                  = NULL,
-    .dispatch_method      = ESP_TIMER_TASK,
-    .name                 = "cw_sample",
+    .callback              = cwTimerCallback,
+    .arg                   = NULL,
+    .dispatch_method       = ESP_TIMER_TASK,
+    .name                  = "cw_sample",
     .skip_unhandled_events = true,
   };
 
@@ -383,6 +439,13 @@ bool cwTickTime(void)
         cwCode         = 1;
         cwLetterDecoded = false;
       }
+      else if((now - cwStateMs) > CW_DIT_RESET_MS)
+      {
+        // Long silence: reset the adaptive dit-length estimate so that a
+        // new transmission at a different speed gets a fair start.
+        cwDitLen  = CW_DEFAULT_DIT_MS;
+        cwStateMs = now;  // Restart the idle timer to avoid repeated resets
+      }
       break;
 
     // -----------------------------------------------------------------
@@ -399,8 +462,9 @@ bool cwTickTime(void)
             if(cwCode * 2 < MORSE_TREE_SIZE) cwCode *= 2;
             else                             cwCode  = 0;  // Overflow: too many elements
 
-            // Update dit-length estimate (EMA α ≈ 0.25)
-            cwDitLen = (cwDitLen * 3 + dur) / 4;
+            // Update dit-length estimate (EMA α ≈ 0.125 — slower than 0.25
+            // to keep the estimate stable for a consistent sender)
+            cwDitLen = (cwDitLen * 7 + dur) / 8;
           }
           else
           {
@@ -409,7 +473,7 @@ bool cwTickTime(void)
             else                                  cwCode = 0;  // Overflow
 
             // Estimate dit from dah duration (standard ratio = 3:1)
-            cwDitLen = (cwDitLen * 3 + dur / 3) / 4;
+            cwDitLen = (cwDitLen * 7 + dur / 3) / 8;
           }
 
           // Clamp to [CW_MIN_DIT_MS, CW_MAX_DIT_MS]
