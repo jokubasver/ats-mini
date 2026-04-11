@@ -275,6 +275,7 @@ bool dimOn(int x)
 {
   if((x==1) && !dim_on && !sleep_on)
   {
+    // Only dim if not already sleeping (sleep turns off the backlight completely)
     dim_on = true;
     ledcWrite(PIN_LCD_BL, 10);
   }
