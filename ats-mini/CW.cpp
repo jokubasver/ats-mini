@@ -16,7 +16,6 @@
 
 #include "Common.h"
 #include "CW.h"
-#include <freertos/semphr.h>
 #include <math.h>
 
 // Morse binary tree table size (covers up to 5-element codes)
@@ -53,10 +52,10 @@
 #define CW_GOERTZEL_K_MAX      9   // Highest bin → k * fs / N = 9 * 4000 / 40 = 900 Hz
 #define CW_NUM_BINS            (CW_GOERTZEL_K_MAX - CW_GOERTZEL_K_MIN + 1)  // 6 bins
 
-// Ring buffer used to pass ADC samples from the esp_timer callback to the
-// main-loop processor.  Must be a power of 2 and large enough to absorb at
-// least one full display-refresh interval (~20 ms → 80 samples at 4 kHz).
-#define CW_RING_SIZE  128   // 128 samples = 32 ms of headroom
+// Maximum number of ADC samples to read per cwTickTime() call.
+// 80 samples = 20 ms at 4 kHz — enough to process one full Goertzel block
+// per main-loop iteration without blocking the loop for more than ~2.4 ms.
+#define CW_MAX_BATCH  80
 
 // Goertzel magnitude² thresholds for mark/space detection.
 // The Goertzel magnitude² for a pure sine at a bin frequency with
@@ -189,52 +188,16 @@ static char    cwText[CW_TEXT_LEN + 1] = "";
 static uint8_t cwTextLen = 0;
 
 // -----------------------------------------------------------------------
-// ADC ring buffer — written by the sampler task, read by cwTickTime()
+// ADC sampling — done inline in cwTickTime() to avoid FreeRTOS task pressure.
+//
+// cwTickTime() is called every main-loop iteration.  It calculates how many
+// 4 kHz sample periods have elapsed since the last call and reads that many
+// ADC samples directly via analogRead(), up to CW_MAX_BATCH samples.
+// This keeps all ADC work on the Arduino loop task and avoids any interaction
+// with the FreeRTOS scheduler or watchdog timer.
 // -----------------------------------------------------------------------
-// A low-priority FreeRTOS sampler task (priority 2) reads one ADC sample
-// per timer period and pushes it here.  cwTickTime() drains all available
-// samples each main-loop call.
-// Indices are uint8_t so modular arithmetic wraps naturally at 256; the
-// effective buffer length is CW_RING_SIZE (a power of 2).
 
-static volatile int16_t cwRingBuf[CW_RING_SIZE];
-static volatile uint8_t cwRingWrite = 0;  // Written by sampler task
-static volatile uint8_t cwRingRead  = 0;  // Written by cwTickTime()
-
-static hw_timer_t      *cwSampleTimer   = NULL;
-static TaskHandle_t     cwSamplerHandle = NULL;
-static SemaphoreHandle_t cwSampleSem    = NULL;
-
-// Hardware timer ISR: fires at CW_SAMPLE_RATE Hz.
-// Runs in hardware interrupt context — no FreeRTOS task involvement, so it
-// cannot starve the WiFi/BLE scheduler.  Simply signals the sampler task via
-// a binary semaphore and requests a context switch if the task becomes ready.
-static void IRAM_ATTR cwTimerISR(void)
-{
-  BaseType_t woken = pdFALSE;
-  xSemaphoreGiveFromISR(cwSampleSem, &woken);
-  if(woken) portYIELD_FROM_ISR();
-}
-
-// Sampler task (priority 2 — just above the main Arduino loop at priority 1).
-// Wakes whenever the timer signals the semaphore, reads one ADC sample, and
-// pushes it into the ring buffer.  Because this task has higher priority than
-// the main loop it preempts it for the ~20 µs needed by analogRead() and then
-// immediately yields back, giving the main loop ~92 % of CPU time.
-static void cwSamplerTaskFn(void * /*arg*/)
-{
-  for(;;)
-  {
-    xSemaphoreTake(cwSampleSem, portMAX_DELAY);
-    int16_t raw = (int16_t)analogRead(CW_ADC_PIN);
-    uint8_t next = (cwRingWrite + 1) & (CW_RING_SIZE - 1);
-    if(next != cwRingRead)
-    {
-      cwRingBuf[cwRingWrite] = raw;
-      cwRingWrite = next;
-    }
-  }
-}
+static uint32_t cwLastSampleUs = 0;  // micros() timestamp of last sample batch
 
 // -----------------------------------------------------------------------
 // Internal helpers
@@ -295,13 +258,6 @@ static bool cwDecodeChar(void)
 
 void cwInit(void)
 {
-  // Configure the ADC pin and perform a warm-up read so that the ADC
-  // subsystem is fully initialised before the timer starts.  This prevents
-  // the first timer-triggered sample from incurring the one-time setup cost
-  // inside analogRead() while the high-priority timer task is running.
-  analogSetPinAttenuation(CW_ADC_PIN, ADC_11db);
-  analogRead(CW_ADC_PIN);
-
   // Precompute Goertzel coefficients: 2 * cos(2π * k / N) for each bin
   for(int i = 0; i < CW_NUM_BINS; i++)
   {
@@ -322,62 +278,13 @@ void cwInit(void)
   cwText[0]      = '\0';
   cwLetterDecoded = false;
 
-  // Reset ring buffer
-  cwRingWrite = cwRingRead = 0;
+  // Warm up the ADC: configure attenuation and discard the first conversion,
+  // which often returns an out-of-range value on ESP32-S3.
+  analogSetPinAttenuation(CW_ADC_PIN, ADC_11db);
+  analogRead(CW_ADC_PIN);
 
-  // Stop and clean up any resources left over from a previous cwInit() call.
-  if(cwSampleTimer != NULL)
-  {
-    timerEnd(cwSampleTimer);
-    cwSampleTimer = NULL;
-  }
-  if(cwSamplerHandle != NULL)
-  {
-    vTaskDelete(cwSamplerHandle);
-    cwSamplerHandle = NULL;
-  }
-  if(cwSampleSem != NULL)
-  {
-    vSemaphoreDelete(cwSampleSem);
-    cwSampleSem = NULL;
-  }
-
-  // Create the binary semaphore used by the ISR to wake the sampler task.
-  cwSampleSem = xSemaphoreCreateBinary();
-  if(cwSampleSem == NULL) return;
-
-  // Create the ADC sampler task at priority 2 (above the main loop at 1).
-  // Stack: 4096 bytes — analogRead() on ESP32-S3 calls through the IDF ADC
-  // oneshot driver which needs considerably more stack than 2048 bytes.
-  // Core: pinned to core 1, the same core as the Arduino loop task, so that
-  // the ADC driver is always accessed from the same core Arduino expects.
-  if(xTaskCreatePinnedToCore(cwSamplerTaskFn, "cw_smpl", 4096, NULL, 2,
-                              &cwSamplerHandle, 1) != pdPASS)
-  {
-    cwSamplerHandle = NULL;
-    vSemaphoreDelete(cwSampleSem);
-    cwSampleSem = NULL;
-    return;
-  }
-
-  // Create and start the 4 kHz hardware timer that wakes the sampler task.
-  // timerBegin(1000000) creates a 1 MHz counter; timerAlarm fires every
-  // CW_SAMPLE_US (250) counts = 250 µs = 4 kHz.
-  // The ISR runs in hardware interrupt context — no FreeRTOS service task is
-  // involved, so it cannot interfere with WiFi/BLE scheduler tasks.
-  cwSampleTimer = timerBegin(1000000);
-  if(cwSampleTimer != NULL)
-  {
-    timerAttachInterrupt(cwSampleTimer, cwTimerISR);
-    timerAlarm(cwSampleTimer, CW_SAMPLE_US, true, 0);
-  }
-  else
-  {
-    vTaskDelete(cwSamplerHandle);
-    cwSamplerHandle = NULL;
-    vSemaphoreDelete(cwSampleSem);
-    cwSampleSem = NULL;
-  }
+  // Capture the current time so that cwTickTime() starts sampling immediately.
+  cwLastSampleUs = micros();
 }
 
 // Called every main-loop iteration.  Returns true when the decoded text
@@ -388,18 +295,29 @@ bool cwTickTime(void)
   bool     changed = false;
 
   // -----------------------------------------------------------------------
-  // Drain ADC samples from the ring buffer populated by the 4 kHz timer.
+  // Read ADC samples inline — no FreeRTOS task, no hardware timer, no ISR.
   //
-  // Because the timer fires at the correct hardware rate, every sample is
-  // genuinely 250 µs apart and the Goertzel frequency bins are accurate.
+  // Calculate how many 4 kHz sample periods (250 µs each) have elapsed since
+  // the last batch, read that many samples directly via analogRead(), then
+  // advance cwLastSampleUs by exactly that many periods so that jitter in
+  // the main-loop call rate does not accumulate error.
+  //
+  // The batch is capped at CW_MAX_BATCH (80 samples = 20 ms) so that even
+  // after a long display refresh the loop does not block for more than ~2 ms
+  // of ADC reads.  Dropped samples cannot be recovered, but missing a few
+  // samples during screen updates has no audible or functional impact on CW
+  // decoding — dits and dahs are 20–500 ms long.
   // -----------------------------------------------------------------------
-  while(cwRingRead != cwRingWrite)
-  {
-    int32_t raw = cwRingBuf[cwRingRead];
-    cwRingRead = (cwRingRead + 1) & (CW_RING_SIZE - 1);
+  uint32_t nowUs    = micros();
+  uint32_t elapsedUs = nowUs - cwLastSampleUs;
+  uint32_t numSamples = elapsedUs / CW_SAMPLE_US;
+  if(numSamples > CW_MAX_BATCH) numSamples = CW_MAX_BATCH;
 
-    // Read ADC and remove slowly-tracked DC offset.
-    // The ESP32-S3 ADC is 12-bit (0–4095); cwDcBias is initialised to 2048.
+  for(uint32_t s = 0; s < numSamples; s++)
+  {
+    int32_t raw = (int32_t)analogRead(CW_ADC_PIN);
+
+    // Remove slowly-tracked DC offset.
     // α = 1/256 gives a time constant of ~256 samples = 64 ms at 4 kHz,
     // long enough to track slow DC drift without following the audio signal.
     cwDcBias += (raw - cwDcBias) >> 8;
@@ -434,6 +352,10 @@ bool cwTickTime(void)
       if( cwMarkActive && maxMag2 < CW_THRESHOLD_OFF2) cwMarkActive = false;
     }
   }
+
+  // Advance the sample timestamp by exactly the number of samples consumed
+  // so that fractional periods carry forward to the next call.
+  cwLastSampleUs += numSamples * CW_SAMPLE_US;
 
   bool isMark = cwMarkActive;
 
