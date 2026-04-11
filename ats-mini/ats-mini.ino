@@ -46,6 +46,7 @@ long lastStrengthCheck = millis();
 long lastRDSCheck = millis();
 long lastNTPCheck = millis();
 long lastScheduleCheck = millis();
+long lastScrollTick = millis();
 
 long elapsedCommand = millis();
 volatile int16_t encoderCount = 0;
@@ -977,6 +978,13 @@ void loop()
   {
     needRedraw |= (currentMode == FM) && (snr >= 12) && checkRds();
     lastRDSCheck = currentTime;
+  }
+
+  // Periodically tick PS scroll animation (~10 fps)
+  if((currentTime - lastScrollTick) > 100)
+  {
+    needRedraw |= (currentMode == FM) && isPsScrolling();
+    lastScrollTick = currentTime;
   }
 
   // Periodically check schedule
