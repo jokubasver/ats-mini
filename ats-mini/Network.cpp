@@ -352,7 +352,7 @@ static void audioSendTask(void *)
 static void audioTimerCB(void *)
 {
   if(audioSampleH)
-    vTaskNotifyGive(audioSampleH);
+    xTaskNotifyGive(audioSampleH);
 }
 
 //
@@ -362,7 +362,7 @@ static void audioTimerCB(void *)
 //
 static void audioSampleTask(void *)
 {
-  analogSetPinAttenuation(AUDIO_PIN, ADC_ATTEN_DB_12);  // 0–3.3 V range
+  analogSetPinAttenuation(AUDIO_PIN, ADC_11db);  // 0–3.3 V range
 
   while(ulTaskNotifyTake(pdTRUE, portMAX_DELAY) && audioRunning)
   {
@@ -426,7 +426,7 @@ static void stopAudioSampling()
   audioTimer = nullptr;
 
   // Wake the sampling task one last time so it can see audioRunning == false.
-  if(audioSampleH) vTaskNotifyGive(audioSampleH);
+  if(audioSampleH) xTaskNotifyGive(audioSampleH);
   for(int i = 0; i < 200 && audioSampleH; i++) vTaskDelay(1);
 
   // Send a poison pill to wake and stop the send task.
