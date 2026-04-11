@@ -21,8 +21,15 @@ static bool dim_on = false;
 static uint32_t dimStartTime = 0;
 static uint16_t dimStartBrt  = 0;
 
-#define DIM_FADE_MS  3000  // Fade duration in ms
+#define DIM_FADE_MS  3000  // Fade-down duration in ms
 #define DIM_MIN_BRT  10    // Minimum brightness after dim
+
+// Wake-up fade state (fade back up after un-dimming)
+static bool     wake_on       = false;
+static uint32_t wakeStartTime = 0;
+static uint16_t wakeStartBrt  = 0;
+
+#define WAKE_FADE_MS 1000  // Fade-up duration in ms
 
 // Current SSB patch status
 static bool ssbLoaded = false;
@@ -203,7 +210,8 @@ bool sleepOn(int x)
   if((x==1) && !sleep_on)
   {
     sleep_on = true;
-    dim_on = false;
+    dim_on   = false;
+    wake_on  = false;
     ledcWrite(PIN_LCD_BL, 0);
     spr.fillSprite(TFT_BLACK);
     spr.pushSprite(0, 0);
@@ -289,8 +297,24 @@ bool dimOn(int x)
   }
   else if((x==0) && dim_on)
   {
+    // Compute brightness at this exact moment so the wake fade starts from here
+    uint32_t elapsed = millis() - dimStartTime;
+    int startBrt;
+    if(elapsed >= DIM_FADE_MS)
+      startBrt = DIM_MIN_BRT;
+    else
+    {
+      startBrt = (int)dimStartBrt - (int)((dimStartBrt - DIM_MIN_BRT) * elapsed / DIM_FADE_MS);
+      if(startBrt < DIM_MIN_BRT) startBrt = DIM_MIN_BRT;
+    }
+
     dim_on = false;
-    if(!sleep_on) ledcWrite(PIN_LCD_BL, currentBrt);
+    if(!sleep_on)
+    {
+      wake_on       = true;
+      wakeStartTime = millis();
+      wakeStartBrt  = (uint16_t)startBrt;
+    }
   }
 
   return(dim_on);
@@ -303,6 +327,24 @@ bool dimOn(int x)
 //
 void dimTickTime()
 {
+  // Wake-up fade: linearly ramp from dim level back to full brightness over WAKE_FADE_MS.
+  if(wake_on && !sleep_on)
+  {
+    uint32_t elapsed = millis() - wakeStartTime;
+    if(elapsed >= WAKE_FADE_MS)
+    {
+      wake_on = false;
+      ledcWrite(PIN_LCD_BL, currentBrt);
+    }
+    else
+    {
+      int brightness = (int)wakeStartBrt + (int)((currentBrt - wakeStartBrt) * elapsed / WAKE_FADE_MS);
+      if(brightness > currentBrt) brightness = currentBrt;
+      ledcWrite(PIN_LCD_BL, brightness);
+    }
+    return;
+  }
+
   if(!dim_on || sleep_on) return;
 
   uint32_t elapsed = millis() - dimStartTime;
