@@ -12,8 +12,20 @@
 #include <ESPAsyncWebServer.h>
 #include <NTPClient.h>
 #include <ESPmDNS.h>
+#include <esp_timer.h>
 
 #define CONNECT_TIME  3000  // Time of inactivity to start connecting WiFi
+
+// Audio streaming via WebSocket
+#define AUDIO_PIN          11    // GPIO11 – ADC input from NS4160 pin 8 via RC filter
+#define AUDIO_SAMPLE_RATE  8000  // 8 kHz sample rate
+#define AUDIO_CHUNK_SIZE   256   // Samples per WebSocket message (32 ms)
+
+static uint8_t            audioChunk[2][AUDIO_CHUNK_SIZE]; // double buffer
+static volatile int       audioChunkIdx = 0;               // active write buffer
+static volatile int       audioChunkPos = 0;
+static esp_timer_handle_t audioTimer    = nullptr;
+static AsyncWebSocket     audioWS("/audiows");
 
 WiFiMulti wifiMulti;
 
@@ -48,11 +60,15 @@ static void webInit();
 
 static void webSetConfig(AsyncWebServerRequest *request);
 
+static void startAudioSampling();
+static void stopAudioSampling();
+
 static const String webInputField(const String &name, const String &value, bool pass = false);
 static const String webStyleSheet();
 static const String webPage(const String &body);
 static const String webUtcOffsetSelector();
 static const String webThemeSelector();
+static const String webAudioPage();
 static const String webRadioPage();
 static const String webMemoryPage();
 static const String webConfigPage();
@@ -296,6 +312,57 @@ static bool wifiConnect()
 }
 
 //
+// Audio ADC sampling callback – runs at AUDIO_SAMPLE_RATE Hz
+//
+static void audioSampleCB(void *)
+{
+  uint16_t raw = analogRead(AUDIO_PIN);
+  audioChunk[audioChunkIdx][audioChunkPos++] = (uint8_t)(raw >> 4);
+  if(audioChunkPos >= AUDIO_CHUNK_SIZE)
+  {
+    int sendIdx   = audioChunkIdx;
+    audioChunkIdx ^= 1;  // swap to other buffer before sending
+    audioChunkPos  = 0;
+    if(audioWS.count() > 0)
+      audioWS.binaryAll(audioChunk[sendIdx], AUDIO_CHUNK_SIZE);
+  }
+}
+
+static void startAudioSampling()
+{
+  if(audioTimer) return;
+  analogSetPinAttenuation(AUDIO_PIN, ADC_11db);
+  audioChunkIdx = 0;
+  audioChunkPos = 0;
+  esp_timer_create_args_t args = {};
+  args.callback              = audioSampleCB;
+  args.dispatch_method       = ESP_TIMER_TASK;
+  args.name                  = "audioADC";
+  args.skip_unhandled_events = true;
+  esp_timer_create(&args, &audioTimer);
+  esp_timer_start_periodic(audioTimer, 1000000ULL / AUDIO_SAMPLE_RATE);
+}
+
+static void stopAudioSampling()
+{
+  if(!audioTimer) return;
+  esp_timer_stop(audioTimer);
+  esp_timer_delete(audioTimer);
+  audioTimer    = nullptr;
+  audioChunkIdx = 0;
+  audioChunkPos = 0;
+}
+
+static void audioWSEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+                         AwsEventType type, void *arg, uint8_t *data, size_t len)
+{
+  if(type == WS_EVT_CONNECT)
+    startAudioSampling();
+  else if(type == WS_EVT_DISCONNECT && audioWS.count() <= 1)
+    stopAudioSampling();
+}
+
+//
 // Initialize internal web server
 //
 static void webInit()
@@ -315,12 +382,20 @@ static void webInit()
     request->send(200, "text/html", webConfigPage());
   });
 
+  server.on("/audio", HTTP_ANY, [] (AsyncWebServerRequest *request) {
+    request->send(200, "text/html", webAudioPage());
+  });
+
   server.onNotFound([] (AsyncWebServerRequest *request) {
     request->send(404, "text/plain", "Not found");
   });
 
   // This method saves configuration form contents
   server.on("/setconfig", HTTP_ANY, webSetConfig);
+
+  // WebSocket endpoint for audio streaming
+  audioWS.onEvent(audioWSEvent);
+  server.addHandler(&audioWS);
 
   // Start web server
   server.begin();
@@ -518,6 +593,57 @@ static const String webThemeSelector()
   return(result);
 }
 
+static const String webAudioPage()
+{
+  return webPage(
+"<H1>ATS-Mini Audio Stream</H1>"
+"<P ALIGN='CENTER'>"
+  "<A HREF='/'>Status</A>&nbsp;|&nbsp;"
+  "<A HREF='/memory'>Memory</A>&nbsp;|&nbsp;"
+  "<A HREF='/config'>Config</A>"
+"</P>"
+"<TABLE>"
+"<TR><TD CLASS='CENTER'>"
+  "<BUTTON ID='sta' ONCLICK='startAudio()'>&#9654; Start</BUTTON>"
+  "&nbsp;"
+  "<BUTTON ID='sto' ONCLICK='stopAudio()' DISABLED>&#9632; Stop</BUTTON>"
+"</TD></TR>"
+"<TR><TD CLASS='CENTER' ID='st'>Press Start to listen</TD></TR>"
+"</TABLE>"
+"<SCRIPT>"
+"var ctx=null,ws=null,npt=0;"
+"function startAudio(){"
+  "if(ws)return;"
+  "ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:8000});"
+  "ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/audiows');"
+  "ws.binaryType='arraybuffer';"
+  "ws.onopen=function(){document.getElementById('st').textContent='Streaming...';};"
+  "ws.onmessage=function(e){"
+    "var b=new Uint8Array(e.data);"
+    "var a=ctx.createBuffer(1,b.length,8000);"
+    "var d=a.getChannelData(0);"
+    "for(var i=0;i<b.length;i++)d[i]=b[i]/128.0-1.0;"
+    "var s=ctx.createBufferSource();"
+    "s.buffer=a;s.connect(ctx.destination);"
+    "var n=ctx.currentTime;if(npt<n)npt=n+0.05;"
+    "s.start(npt);npt+=b.length/8000;"
+  "};"
+  "ws.onclose=function(){stopAudio();};"
+  "document.getElementById('sta').disabled=true;"
+  "document.getElementById('sto').disabled=false;"
+"}"
+"function stopAudio(){"
+  "if(ws){ws.close();ws=null;}"
+  "if(ctx){ctx.close();ctx=null;}"
+  "npt=0;"
+  "document.getElementById('sta').disabled=false;"
+  "document.getElementById('sto').disabled=true;"
+  "document.getElementById('st').textContent='Stopped';"
+"}"
+"</SCRIPT>"
+  );
+}
+
 static const String webRadioPage()
 {
   String ip = "";
@@ -540,7 +666,7 @@ static const String webRadioPage()
   return webPage(
 "<H1>ATS-Mini Pocket Receiver</H1>"
 "<P ALIGN='CENTER'>"
-  "<A HREF='/memory'>Memory</A>&nbsp;|&nbsp;<A HREF='/config'>Config</A>"
+  "<A HREF='/memory'>Memory</A>&nbsp;|&nbsp;<A HREF='/config'>Config</A>&nbsp;|&nbsp;<A HREF='/audio'>Audio</A>"
 "</P>"
 "<TABLE COLUMNS=2>"
 "<TR>"
@@ -603,7 +729,7 @@ static const String webMemoryPage()
   return webPage(
 "<H1>ATS-Mini Pocket Receiver Memory</H1>"
 "<P ALIGN='CENTER'>"
-  "<A HREF='/'>Status</A>&nbsp;|&nbsp;<A HREF='/config'>Config</A>"
+  "<A HREF='/'>Status</A>&nbsp;|&nbsp;<A HREF='/config'>Config</A>&nbsp;|&nbsp;<A HREF='/audio'>Audio</A>"
 "</P>"
 "<TABLE COLUMNS=2>" + items + "</TABLE>"
 );
@@ -625,6 +751,7 @@ const String webConfigPage()
 "<P ALIGN='CENTER'>"
   "<A HREF='/'>Status</A>"
   "&nbsp;|&nbsp;<A HREF='/memory'>Memory</A>"
+  "&nbsp;|&nbsp;<A HREF='/audio'>Audio</A>"
 "</P>"
 "<FORM ACTION='/setconfig' METHOD='POST'>"
   "<TABLE COLUMNS=2>"
