@@ -64,9 +64,10 @@ const char *rbdsProgramTypes[32] =
   0, "Weather", "TEST", "! ALERT !"
 };
 
-static char bufStationName[50]  = "";
-static char bufRadioText[100]   = "";
-static char bufProgramInfo[100] = "";
+static char bufStationName[50]   = "";
+static char bufRadioText[100]    = "";
+static char stageRadioText[100]  = "";
+static char bufProgramInfo[100]  = "";
 static uint16_t piCode = 0x0000;
 
 const char *getStationName()
@@ -94,10 +95,12 @@ uint16_t getRdsPiCode()
 
 void clearStationInfo()
 {
-  bufStationName[0] = '\0';
-  bufProgramInfo[0] = '\0';
-  bufRadioText[0]   = '\0'; // Multiline!
-  bufRadioText[1]   = '\0';
+  bufStationName[0]  = '\0';
+  bufProgramInfo[0]  = '\0';
+  bufRadioText[0]    = '\0'; // Multiline!
+  bufRadioText[1]    = '\0';
+  stageRadioText[0]  = '\0'; // Reset staging buffer too
+  stageRadioText[1]  = '\0';
   piCode = 0x0000;
 }
 
@@ -122,6 +125,7 @@ static bool showStationName(const char *stationName, bool isLong = false)
 
 static bool showRadioText(const char *radioText, uint8_t width = 32)
 {
+  char newBuf[100] = {};
   bool changed = false;
   int i, d, j;
   char c;
@@ -134,7 +138,7 @@ static bool showRadioText(const char *radioText, uint8_t width = 32)
 
   // Terminate at 0x0D, split into lines by 0x0A.
   // Use a separate destination index 'd' so skipped leading whitespace
-  // does not shift content away from position 0 in bufRadioText.
+  // does not shift content away from position 0 in newBuf.
   for(d=0, j=0 ; (i<64) && radioText[i] && (radioText[i]!=0x0D) ; i++)
   {
     // Skip non-printable control characters (except 0x0A explicit line break)
@@ -151,21 +155,37 @@ static bool showRadioText(const char *radioText, uint8_t width = 32)
       j++;
     }
 
-    changed |= c != bufRadioText[d];
-    bufRadioText[d++] = c;
+    newBuf[d++] = c;
   }
 
   // Skip trailing whitespace
-  while((d>0) && (bufRadioText[d-1]<=' ')) d--;
+  while((d>0) && (newBuf[d-1]<=' ')) d--;
 
-  // Check the end of the buffer for changes
-  changed |= bufRadioText[d] || bufRadioText[d+1];
+  // Double-null terminate
+  newBuf[d]   = '\0';
+  newBuf[d+1] = '\0';
 
-  // Terminate multiline text with two zeros
-  bufRadioText[d++] = '\0';
-  bufRadioText[d++] = '\0';
+  // Only commit to the display buffer when two consecutive calls produce the same
+  // processed result. This prevents garbled text during in-progress RT updates,
+  // which arrive 4 characters at a time from the SI4735 library.
+  if(memcmp(newBuf, stageRadioText, d+2) == 0)
+  {
+    // Text is stable — update display buffer if it differs
+    changed |= bufRadioText[d] || bufRadioText[d+1];
+    for(int k=0 ; k<d ; k++)
+    {
+      changed |= newBuf[k] != bufRadioText[k];
+      bufRadioText[k] = newBuf[k];
+    }
+    bufRadioText[d]   = '\0';
+    bufRadioText[d+1] = '\0';
+  }
+  else
+  {
+    // Text is still changing — update stage only, do not touch the display buffer
+    memcpy(stageRadioText, newBuf, d+2);
+  }
 
-  // Done
   return(changed);
 }
 
