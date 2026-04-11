@@ -473,27 +473,17 @@ bool updateBFO(int newBFO, bool wrap)
   }
 
   // If need to change frequency...
-  bool didMute = false;
-  if(newFreq != currentFrequency)
+  bool freqChanged = (newFreq != currentFrequency);
+  if(freqChanged)
   {
-    // Mute to suppress the audible thump caused by the carrier frequency change.
-    // Only mute if not already muted (e.g. when called from doSeek which mutes first).
-    if(!muteOn(MUTE_TEMP))
-    {
-      muteOn(MUTE_TEMP, true);
-      didMute = true;
-    }
-
     // Apply new frequency
     rx.setFrequency(newFreq);
-
-    // Re-apply to remove noise
-    doAgc(0);
     // Use the value we just sent (setFrequency() tunes exactly in-range)
     currentFrequency = newFreq;
   }
 
-  // Update current BFO
+  // Update BFO immediately after the carrier change so the chip has the correct
+  // BFO value the moment it internally unmutes, minimizing any audio glitch.
   currentBFO = newBFO;
 
   // To move frequency forward, need to move the BFO backwards
@@ -504,8 +494,8 @@ bool updateBFO(int newBFO, bool wrap)
   else
     rx.setSSBBfo(-currentBFO);  // No calibration if not USB/LSB
 
-  // Unmute if we muted above
-  if(didMute) muteOn(MUTE_TEMP, false);
+  // Re-apply AGC after BFO is set (only needed when carrier frequency changed)
+  if(freqChanged) doAgc(0);
 
   // Save current band frequency, w.r.t. new BFO value
   band->currentFreq = currentFrequency + currentBFO / 1000;
