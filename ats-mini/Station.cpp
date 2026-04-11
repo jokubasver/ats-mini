@@ -123,7 +123,7 @@ static bool showStationName(const char *stationName, bool isLong = false)
 static bool showRadioText(const char *radioText, uint8_t width = 32)
 {
   bool changed = false;
-  int i, j;
+  int i, d, j;
   char c;
 
   // Must have text
@@ -132,9 +132,14 @@ static bool showRadioText(const char *radioText, uint8_t width = 32)
   // Skip leading whitespace
   for(i=0 ; (i<64) && radioText[i] && (radioText[i]<=' ') ; i++);
 
-  // Terminate at 0x0D, split into lines by 0x0A
-  for(j=0 ; (i<64) && radioText[i] && (radioText[i]!=0x0D) ; i++)
+  // Terminate at 0x0D, split into lines by 0x0A.
+  // Use a separate destination index 'd' so skipped leading whitespace
+  // does not shift content away from position 0 in bufRadioText.
+  for(d=0, j=0 ; (i<64) && radioText[i] && (radioText[i]!=0x0D) ; i++)
   {
+    // Skip non-printable control characters (except 0x0A explicit line break)
+    if(radioText[i] < ' ' && radioText[i] != 0x0A) continue;
+
     if((radioText[i]==0x0A) || ((radioText[i]==' ') && (j>=width)))
     {
       c = '\0';
@@ -146,19 +151,19 @@ static bool showRadioText(const char *radioText, uint8_t width = 32)
       j++;
     }
 
-    changed |= c!=bufRadioText[i];
-    bufRadioText[i] = c;
+    changed |= c != bufRadioText[d];
+    bufRadioText[d++] = c;
   }
 
   // Skip trailing whitespace
-  while((i>0) && (bufRadioText[i-1]<=' ')) i--;
+  while((d>0) && (bufRadioText[d-1]<=' ')) d--;
 
   // Check the end of the buffer for changes
-  changed |= bufRadioText[i] || bufRadioText[i+1];
+  changed |= bufRadioText[d] || bufRadioText[d+1];
 
-  // Terminate multitline text with two zeros
-  bufRadioText[i++] = '\0';
-  bufRadioText[i++] = '\0';
+  // Terminate multiline text with two zeros
+  bufRadioText[d++] = '\0';
+  bufRadioText[d++] = '\0';
 
   // Done
   return(changed);
@@ -187,6 +192,24 @@ static bool showRdsProgramType(uint8_t pgmType, bool useRBDS = false)
   return(showProgramInfo(text? text:""));
 }
 
+// Sanitize and show RDS PS station name: strip non-printable chars and trailing spaces
+static bool showRdsStationName(const char *stationName)
+{
+  char cleaned[16];
+  int i, d = 0;
+
+  if(!stationName) return(false);
+
+  for(i=0 ; stationName[i] && d<(int)sizeof(cleaned)-1 ; i++)
+    if((uint8_t)stationName[i] >= ' ') cleaned[d++] = stationName[i];
+
+  // Trim trailing spaces
+  while(d>0 && cleaned[d-1]==' ') d--;
+  cleaned[d] = '\0';
+
+  return showStationName(cleaned);
+}
+
 static bool showRdsPiCode(uint16_t rdsPiCode)
 {
   if(rdsPiCode!=piCode)
@@ -203,8 +226,8 @@ static bool showRdsTime(const char *rdsTime)
   // If NTP time available, do not use RDS time
   if(!rdsTime || ntpIsAvailable()) return(false);
 
-  // The standard RDS time format is “HH:MM”.
-  // or sometimes more complex like “DD.MM.YY,HH:MM”.
+  // The standard RDS time format is ï¿½HH:MMï¿½.
+  // or sometimes more complex like ï¿½DD.MM.YY,HH:MMï¿½.
   const char *timeField = strstr(rdsTime, ":");
 
   // If we find a valid time format...
@@ -232,8 +255,8 @@ bool checkRds()
 
   if(rx.getRdsReceived() && rx.getRdsSync() && rx.getRdsSyncFound())
   {
-    needRedraw |= (mode & RDS_PS) && showStationName(rx.getRdsStationName());
-    needRedraw |= (mode & RDS_RT) && showRadioText(rx.getRdsVersionCode()? rx.getRdsText2B() : rx.getRdsText2A());
+    needRedraw |= (mode & RDS_PS) && showRdsStationName(rx.getRdsStationName());
+    needRedraw |= (mode & RDS_RT) && showRadioText(rx.getRdsProgramInformation());
     needRedraw |= (mode & RDS_PI) && showRdsPiCode(rx.getRdsPI());
     needRedraw |= (mode & RDS_CT) && showRdsTime(rx.getRdsTime());
     needRedraw |= (mode & RDS_PT) && showRdsProgramType(rx.getRdsProgramTypeX(), !!(mode & RDS_RBDS));
