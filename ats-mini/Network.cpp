@@ -426,7 +426,7 @@ static void startAudioSampling()
   digCfg.adc_pattern    = &pattern;
   adc_continuous_config(adcHandle, &digCfg);
 
-  adc_continuous_cbs_t cbs = {};
+  adc_continuous_evt_cbs_t cbs = {};
   cbs.on_conv_done = adcConvDoneCB;
   adc_continuous_register_event_callbacks(adcHandle, &cbs, nullptr);
 
