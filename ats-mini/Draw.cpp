@@ -340,87 +340,13 @@ void drawStereoIndicator(int x, int y, bool stereo)
 }
 
 //
-// PS scroll animation state
-// While the station name is being received the PS debounce in Station.cpp
-// suppresses display of partial names; while it is stable the name is shown
-// statically for PS_STATIC_HOLD_MS, then scrolls right-to-left across the
-// screen, and the cycle repeats.  This keeps the animation visually clean
-// and ensures only fully confirmed names are ever displayed.
-
-static uint8_t  psScrollState  = 0;      // 0 = static, 1 = scrolling
-static uint32_t psStateMs      = 0;      // timestamp of last state change
-static float    psScrollPos    = 0.0f;   // current scroll offset (pixels)
-static uint32_t psScrollMs     = 0;      // timestamp of last scroll advance
-static char     psLastName[50] = "";     // last name passed to drawStationName
-
-#define PS_STATIC_HOLD_MS   1500          // ms to hold name statically
-#define PS_SCROLL_SPEED_PPS 60.0f         // pixels per second scroll speed
-
-bool isPsScrolling()
-{
-  // Only report scrolling when there is a real (non-EiBi) name to show
-  const char *name = getStationName();
-  return(psScrollState == 1 && name && name[0] && name[0] != (char)0xFF);
-}
-
-//
 // Draw RDS station name (also CB channel, etc)
 //
 void drawStationName(const char *name, int x, int y)
 {
-  uint32_t now = millis();
-
-  // Detect a newly committed (debounced) name and reset to static display
-  if(strcmp(name, psLastName) != 0)
-  {
-    strncpy(psLastName, name, sizeof(psLastName) - 1);
-    psLastName[sizeof(psLastName) - 1] = '\0';
-    psScrollState = 0;
-    psStateMs     = now;
-    psScrollPos   = 0.0f;
-    psScrollMs    = now;
-  }
-
+  spr.setTextDatum(TC_DATUM);
   spr.setTextColor(TH.rds_text);
-
-  if(psScrollState == 0) // static phase
-  {
-    if(name[0] && (now - psStateMs) >= PS_STATIC_HOLD_MS)
-    {
-      // Hold time expired — start scrolling
-      psScrollState = 1;
-      psScrollPos   = 0.0f;
-      psScrollMs    = now;
-    }
-    spr.setTextDatum(TC_DATUM);
-    spr.drawString(name, x, y, 4);
-  }
-  else // scrolling phase: text enters from the right and exits to the left
-  {
-    // Advance scroll position by elapsed time
-    uint32_t elapsed = now - psScrollMs;
-    psScrollMs   = now;
-    psScrollPos += (float)elapsed * PS_SCROLL_SPEED_PPS / 1000.0f;
-
-    int   textWidth   = (int)spr.textWidth(name, 4);
-    float scrollRange = 320.0f + textWidth; // distance from off-right to off-left
-
-    if(psScrollPos >= scrollRange)
-    {
-      // Full traversal complete — return to static
-      psScrollState = 0;
-      psStateMs     = now;
-      psScrollPos   = 0.0f;
-      spr.setTextDatum(TC_DATUM);
-      spr.drawString(name, x, y, 4);
-    }
-    else
-    {
-      // Text left-edge starts at x=320 and decreases; sprite clips the overflow
-      spr.setTextDatum(TL_DATUM);
-      spr.drawString(name, 320 - (int)psScrollPos, y, 4);
-    }
-  }
+  spr.drawString(name, x, y, 4);
 }
 
 //
