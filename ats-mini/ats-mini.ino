@@ -473,8 +473,17 @@ bool updateBFO(int newBFO, bool wrap)
   }
 
   // If need to change frequency...
+  bool didMute = false;
   if(newFreq != currentFrequency)
   {
+    // Mute to suppress the audible thump caused by the carrier frequency change.
+    // Only mute if not already muted (e.g. when called from doSeek which mutes first).
+    if(!muteOn(MUTE_TEMP))
+    {
+      muteOn(MUTE_TEMP, true);
+      didMute = true;
+    }
+
     // Apply new frequency
     rx.setFrequency(newFreq);
 
@@ -494,6 +503,9 @@ bool updateBFO(int newBFO, bool wrap)
     rx.setSSBBfo(-(currentBFO + band->lsbCal));
   else
     rx.setSSBBfo(-currentBFO);  // No calibration if not USB/LSB
+
+  // Unmute if we muted above
+  if(didMute) muteOn(MUTE_TEMP, false);
 
   // Save current band frequency, w.r.t. new BFO value
   band->currentFreq = currentFrequency + currentBFO / 1000;
