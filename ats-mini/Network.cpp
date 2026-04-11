@@ -318,8 +318,11 @@ static bool wifiConnect()
 }
 
 //
-// Audio timer ISR – fires at AUDIO_SAMPLE_RATE Hz on core 0 but does no work:
-// it just wakes the audio task on core 1 via a binary semaphore.
+// Audio timer callback – fires at AUDIO_SAMPLE_RATE Hz.
+// Uses ESP_TIMER_TASK dispatch (the only option available in arduino core
+// 3.3.7 / ESP-IDF 5.1).  The callback itself does no heavy work: it just
+// wakes the audio task on core 1 via a binary semaphore so that all ADC
+// reads and WebSocket sends happen there, away from the WiFi stack on core 0.
 //
 static void IRAM_ATTR audioTimerCB(void *)
 {
@@ -371,7 +374,7 @@ static void startAudioSampling()
 
   esp_timer_create_args_t args = {};
   args.callback              = audioTimerCB;
-  args.dispatch_method       = ESP_TIMER_ISR;  // very brief ISR on core 0
+  args.dispatch_method       = ESP_TIMER_TASK;  // only dispatch method in ESP-IDF 5.1
   args.name                  = "audioADC";
   args.skip_unhandled_events = true;
   esp_timer_create(&args, &audioTimer);
