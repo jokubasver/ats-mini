@@ -3,7 +3,7 @@
 #include "Menu.h"
 
 // Tuning delays after rx.setFrequency()
-#define TUNE_DELAY_DEFAULT 30
+#define TUNE_DELAY_DEFAULT 10   // Normal VFO tuning delay (ms); band-change settle handled by useBand()
 #define TUNE_DELAY_FM      60
 #define TUNE_DELAY_AM_SSB  80
 

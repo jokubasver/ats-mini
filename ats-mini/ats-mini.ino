@@ -421,6 +421,8 @@ void useBand(const Band *band)
   doAgc(0);
   // Set currentAVC values based on mode (AM, SSB)
   doAvc(0);
+  // Set a short delay for subsequent VFO tuning steps (band-change settle time is handled below)
+  rx.setMaxDelaySetFrequency(10);
   // Wait a bit for things to calm down
   delay(100);
   // Clear signal strength readings
@@ -472,8 +474,8 @@ bool updateBFO(int newBFO, bool wrap)
 
     // Re-apply to remove noise
     doAgc(0);
-    // Update current frequency
-    currentFrequency = rx.getFrequency();
+    // Use the value we just sent (setFrequency() tunes exactly in-range)
+    currentFrequency = newFreq;
   }
 
   // Update current BFO
@@ -515,8 +517,8 @@ bool updateFrequency(int newFreq, bool wrap)
   // Clear BFO, if present
   if(currentBFO) updateBFO(0, true);
 
-  // Update current frequency
-  currentFrequency = rx.getFrequency();
+  // Use the value we just sent (setFrequency() tunes exactly in-range)
+  currentFrequency = newFreq;
 
   // Save current band frequency
   band->currentFreq = currentFrequency + currentBFO / 1000;
