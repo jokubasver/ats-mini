@@ -3,7 +3,6 @@
 #include "Utils.h"
 #include "Menu.h"
 #include "EIBI.h"
-#include "CW.h"
 
 // CB frequency range
 #define MIN_CB_FREQUENCY 26060
@@ -104,7 +103,6 @@ void clearStationInfo()
   bufRadioText[0]    = '\0'; // Multiline!
   bufRadioText[1]    = '\0';
   piCode = 0x0000;
-  clearCwText();
 }
 
 static bool showStationName(const char *stationName, bool isLong = false)
