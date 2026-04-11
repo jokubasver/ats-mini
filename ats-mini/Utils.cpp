@@ -14,6 +14,23 @@ extern ButtonTracker pb1;
 // Current sleep status, returned by sleepOn()
 static bool sleep_on = false;
 
+// Current dim status, returned by dimOn()
+static bool dim_on = false;
+
+// Dim fade state
+static uint32_t dimStartTime = 0;
+static uint16_t dimStartBrt  = 0;
+
+#define DIM_FADE_MS  3000  // Fade-down duration in ms
+#define DIM_MIN_BRT  10    // Minimum brightness after dim
+
+// Wake-up fade state (fade back up after un-dimming)
+static bool     wake_on       = false;
+static uint32_t wakeStartTime = 0;
+static uint16_t wakeStartBrt  = 0;
+
+#define WAKE_FADE_MS 1000  // Fade-up duration in ms
+
 // Current SSB patch status
 static bool ssbLoaded = false;
 
@@ -193,6 +210,8 @@ bool sleepOn(int x)
   if((x==1) && !sleep_on)
   {
     sleep_on = true;
+    dim_on   = false;
+    wake_on  = false;
     ledcWrite(PIN_LCD_BL, 0);
     spr.fillSprite(TFT_BLACK);
     spr.pushSprite(0, 0);
@@ -249,6 +268,7 @@ bool sleepOn(int x)
   else if((x==0) && sleep_on)
   {
     sleep_on = false;
+    dim_on = false;
     tft.writecommand(ST7789_SLPOUT);
     delay(120);
     tft.writecommand(ST7789_DISPON);
@@ -261,6 +281,86 @@ bool sleepOn(int x)
   }
 
   return(sleep_on);
+}
+
+//
+// Turn dim on (1) or off (0), or get current status (2)
+//
+bool dimOn(int x)
+{
+  if((x==1) && !dim_on && !sleep_on)
+  {
+    // Only dim if not already sleeping (sleep turns off the backlight completely)
+    dim_on = true;
+    dimStartTime = millis();
+    dimStartBrt  = currentBrt;
+  }
+  else if((x==0) && dim_on)
+  {
+    // Compute brightness at this exact moment so the wake fade starts from here
+    uint32_t elapsed = millis() - dimStartTime;
+    uint16_t startBrt;
+    if(elapsed >= DIM_FADE_MS)
+      startBrt = DIM_MIN_BRT;
+    else
+    {
+      int brt = (int)dimStartBrt - (int)((uint32_t)(dimStartBrt - DIM_MIN_BRT) * elapsed / DIM_FADE_MS);
+      if(brt < DIM_MIN_BRT) brt = DIM_MIN_BRT;
+      startBrt = (uint16_t)brt;
+    }
+
+    dim_on = false;
+    if(!sleep_on)
+    {
+      wake_on       = true;
+      wakeStartTime = millis();
+      wakeStartBrt  = (uint16_t)startBrt;
+    }
+  }
+
+  return(dim_on);
+}
+
+//
+// Advance the dim fade — call every main loop iteration while dimming.
+// Writes a linearly interpolated PWM value from dimStartBrt down to 10
+// over DIM_FADE_MS milliseconds.
+//
+void dimTickTime()
+{
+  // Wake-up fade: linearly ramp from dim level back to full brightness over WAKE_FADE_MS.
+  if(wake_on && !sleep_on)
+  {
+    uint32_t elapsed = millis() - wakeStartTime;
+    if(elapsed >= WAKE_FADE_MS)
+    {
+      wake_on = false;
+      ledcWrite(PIN_LCD_BL, currentBrt);
+    }
+    else
+    {
+      int brightness = (int)wakeStartBrt + (int)((uint32_t)(currentBrt - wakeStartBrt) * elapsed / WAKE_FADE_MS);
+      if(brightness > currentBrt) brightness = currentBrt;
+      ledcWrite(PIN_LCD_BL, brightness);
+    }
+    return;
+  }
+
+  if(!dim_on || sleep_on) return;
+
+  uint32_t elapsed = millis() - dimStartTime;
+  if(elapsed >= DIM_FADE_MS)
+  {
+    ledcWrite(PIN_LCD_BL, DIM_MIN_BRT);
+  }
+  else
+  {
+    // Linear fade: starts at dimStartBrt (elapsed=0) and decreases to DIM_MIN_BRT (elapsed=DIM_FADE_MS).
+    // uint32_t subtraction handles millis() rollover correctly.
+    int brightness = (int)dimStartBrt - (int)((uint32_t)(dimStartBrt - DIM_MIN_BRT) * elapsed / DIM_FADE_MS);
+    if(brightness < DIM_MIN_BRT) brightness = DIM_MIN_BRT;
+    ledcWrite(PIN_LCD_BL, brightness);
+  }
 }
 
 //

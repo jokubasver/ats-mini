@@ -45,6 +45,7 @@
 #define CMD_BLEMODE    0x2E00 // |
 #define CMD_WIFIMODE   0x2F00 // |
 #define CMD_ABOUT      0x3000 //-+
+#define CMD_DIM        0x3100 // Display dim timeout
 
 // UI Layouts
 #define UI_DEFAULT  0

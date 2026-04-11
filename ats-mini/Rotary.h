@@ -19,7 +19,7 @@ class Rotary
   public:
     Rotary(char, char);
     // Process pin(s)
-    unsigned char process();
+    ICACHE_RAM_ATTR unsigned char process();
   private:
     unsigned char state;
     unsigned char pin1;

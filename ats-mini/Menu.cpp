@@ -120,12 +120,13 @@ static const char *menu[] =
 #define MENU_ZOOM         7
 #define MENU_SCROLL       8
 #define MENU_SLEEP        9
-#define MENU_SLEEPMODE    10
-#define MENU_LOADEIBI     11
-#define MENU_USBMODE      12
-#define MENU_BLEMODE      13
-#define MENU_WIFIMODE     14
-#define MENU_ABOUT        15
+#define MENU_DIM          10
+#define MENU_SLEEPMODE    11
+#define MENU_LOADEIBI     12
+#define MENU_USBMODE      13
+#define MENU_BLEMODE      14
+#define MENU_WIFIMODE     15
+#define MENU_ABOUT        16
 
 
 int8_t settingsIdx = MENU_BRIGHTNESS;
@@ -142,6 +143,7 @@ static const char *settings[] =
   "Zoom Menu",
   "Scroll Dir.",
   "Sleep",
+  "Dim",
   "Sleep Mode",
   "Load EiBi",
   "USB Port",
@@ -612,6 +614,11 @@ static void doSleep(int16_t enc)
   currentSleep = clamp_range(currentSleep, 5*enc, 0, 255);
 }
 
+static void doDim(int16_t enc)
+{
+  currentDim = clamp_range(currentDim, 5*enc, 0, 255);
+}
+
 static void doSleepMode(int16_t enc)
 {
   sleepModeIdx = wrap_range(sleepModeIdx, enc, 0, LAST_ITEM(sleepModeDesc));
@@ -907,6 +914,7 @@ static void clickSettings(int cmd, bool shortPress)
     case MENU_ZOOM:       currentCmd = CMD_ZOOM;       break;
     case MENU_SCROLL:     currentCmd = CMD_SCROLL;     break;
     case MENU_SLEEP:      currentCmd = CMD_SLEEP;      break;
+    case MENU_DIM:        currentCmd = CMD_DIM;        break;
     case MENU_SLEEPMODE:  currentCmd = CMD_SLEEPMODE;  break;
     case MENU_UTCOFFSET:  currentCmd = CMD_UTCOFFSET;  break;
     case MENU_USBMODE:    currentCmd = CMD_USBMODE;    break;
@@ -950,6 +958,7 @@ bool doSideBar(uint16_t cmd, int16_t enc, int16_t enca)
     case CMD_RDS:        doRDSMode(scrollDirection * enc);break;
     case CMD_MEMORY:     doMemory(scrollDirection * enca);break;
     case CMD_SLEEP:      doSleep(enca);break;
+    case CMD_DIM:        doDim(enca);break;
     case CMD_SLEEPMODE:  doSleepMode(scrollDirection * enc);break;
     case CMD_USBMODE:    doUSBMode(scrollDirection * enc);break;
     case CMD_BLEMODE:    doBleMode(scrollDirection * enc);break;
@@ -1581,6 +1590,16 @@ static void drawSleep(int x, int y, int sx)
   spr.drawNumber(currentSleep, 40+x+(sx/2), 60+y, 4);
 }
 
+static void drawDim(int x, int y, int sx)
+{
+  drawCommon(settings[MENU_DIM], x, y, sx);
+  drawZoomedMenu(settings[MENU_DIM]);
+  spr.setTextDatum(MC_DATUM);
+
+  spr.setTextColor(TH.menu_param);
+  spr.drawNumber(currentDim, 40+x+(sx/2), 60+y, 4);
+}
+
 static void drawZoom(int x, int y, int sx)
 {
   drawCommon(settings[MENU_ZOOM], x, y, sx);
@@ -1704,6 +1723,7 @@ void drawSideBar(uint16_t cmd, int x, int y, int sx)
     case CMD_RDS:        drawRDSMode(x, y, sx);    break;
     case CMD_MEMORY:     drawMemory(x, y, sx);     break;
     case CMD_SLEEP:      drawSleep(x, y, sx);      break;
+    case CMD_DIM:        drawDim(x, y, sx);        break;
     case CMD_SLEEPMODE:  drawSleepMode(x, y, sx);  break;
     case CMD_USBMODE:    drawUSBMode(x, y, sx);    break;
     case CMD_BLEMODE:    drawBleMode(x, y, sx);    break;

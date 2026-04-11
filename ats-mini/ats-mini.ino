@@ -72,6 +72,7 @@ uint8_t FmRegionIdx = 0;                // FM Region
 
 uint16_t currentBrt = 130;              // Display brightness, range = 10 to 255 in steps of 5
 uint16_t currentSleep = DEFAULT_SLEEP;  // Display sleep timeout, range = 0 to 255 in steps of 5
+uint16_t currentDim = 0;               // Display dim timeout, range = 0 (off) to 255 in steps of 5
 long elapsedSleep = millis();           // Display sleep timer
 bool zoomMenu = false;                  // Display zoomed menu item
 int8_t scrollDirection = 1;             // Menu scroll direction
@@ -203,7 +204,7 @@ void setup()
 
   // Check for SI4732 connected on I2C interface
   // If the SI4732 is not detected, then halt with no further processing
-  rx.setI2CFastModeCustom(800000UL);
+  rx.setI2CFastModeCustom(1000000UL);
 
   // Looks for the I2C bus address and set it.  Returns 0 if error
   int16_t si4735Addr = rx.getDeviceI2CAddress(RESET_PIN);
@@ -273,13 +274,13 @@ void setup()
 }
 
 
-int16_t accelerateEncoder(int8_t dir)
+ICACHE_RAM_ATTR int16_t accelerateEncoder(int8_t dir)
 {
   const uint32_t speedThresholds[] = {350, 60, 45, 35, 25}; // ms between clicks
-  const uint16_t accelFactors[] =      {1,  2,  4,  8, 16}; // corresponding multipliers
+  const uint16_t accelFactors[]    =   {1,   2,  4,  8, 16}; // corresponding multipliers
   static uint32_t lastEncoderTime = 0;
   static uint32_t lastSpeed = speedThresholds[0];
-  static uint16_t lastAccelFactor = accelFactors[0];
+  static uint8_t lastAccelIdx = 0;
   static int8_t lastEncoderDir = 0;
 
   uint32_t currentTime = millis();
@@ -288,21 +289,27 @@ int16_t accelerateEncoder(int8_t dir)
   // Reset acceleration on timeout or direction change
   if (lastSpeed > speedThresholds[0] || lastEncoderDir != dir) {
     lastSpeed = speedThresholds[0];
-    lastAccelFactor = accelFactors[0];
+    lastAccelIdx = 0;
   } else {
-    // Lookup acceleration factor
+    // Find the target acceleration level for the current speed
+    uint8_t targetIdx = 0;
     for (int8_t i = LAST_ITEM(speedThresholds); i >= 0; i--) {
-      if (lastSpeed <= speedThresholds[i] && lastAccelFactor < accelFactors[i]) {
-        lastAccelFactor = accelFactors[i];
+      if (lastSpeed <= speedThresholds[i]) {
+        targetIdx = (uint8_t)i;
         break;
       }
     }
+    // Ramp up instantly; ramp down one level at a time to resist noise-induced drops
+    if (targetIdx >= lastAccelIdx)
+      lastAccelIdx = targetIdx;
+    else if (lastAccelIdx > 0)
+      lastAccelIdx--;
   }
+
   lastEncoderTime = currentTime;
   lastEncoderDir = dir;
 
-  // Apply acceleration with direction
-  return(dir * lastAccelFactor);
+  return dir * accelFactors[lastAccelIdx];
 }
 
 //
@@ -420,6 +427,8 @@ void useBand(const Band *band)
   doAgc(0);
   // Set currentAVC values based on mode (AM, SSB)
   doAvc(0);
+  // Set a short delay for subsequent VFO tuning steps (band-change settle time is handled below)
+  rx.setMaxDelaySetFrequency(10);
   // Wait a bit for things to calm down
   delay(100);
   // Clear signal strength readings
@@ -471,8 +480,8 @@ bool updateBFO(int newBFO, bool wrap)
 
     // Re-apply to remove noise
     doAgc(0);
-    // Update current frequency
-    currentFrequency = rx.getFrequency();
+    // Use the value we just sent (setFrequency() tunes exactly in-range)
+    currentFrequency = newFreq;
   }
 
   // Update current BFO
@@ -514,8 +523,8 @@ bool updateFrequency(int newFreq, bool wrap)
   // Clear BFO, if present
   if(currentBFO) updateBFO(0, true);
 
-  // Update current frequency
-  currentFrequency = rx.getFrequency();
+  // Use the value we just sent (setFrequency() tunes exactly in-range)
+  currentFrequency = newFreq;
 
   // Save current band frequency
   band->currentFreq = currentFrequency + currentBFO / 1000;
@@ -753,11 +762,16 @@ void loop()
 
   ButtonTracker::State pb1st = pb1.update(digitalRead(ENCODER_PUSH_BUTTON) == LOW);
 
+  // Detect any user activity (encoder rotation or button event)
+  bool userIsActive = encCount || pb1st.wasClicked || pb1st.wasShortPressed || pb1st.isLongPressed;
+
   // Periodically print status to remote interfaces
   serialTickTime(&Serial, &remoteSerialState, usbModeIdx);
   remoteBLETickTime(&BLESerial, &remoteBLEState, bleModeIdx);
 
-  // if(encCount && getCpuFrequencyMhz()!=240) setCpuFrequencyMhz(240);
+  // Boost CPU to 240 MHz on any user activity for snappier tuning and rendering
+  if(userIsActive && getCpuFrequencyMhz()!=240)
+    setCpuFrequencyMhz(240);
 
   // Receive and execute serial command
   int ser_event = serialDoCommand(&Serial, &remoteSerialState, usbModeIdx);
@@ -779,6 +793,10 @@ void loop()
 
   // Block encoder rotation when in the locked sleep mode
   if(encCount && sleepOn() && sleepModeIdx==SLEEP_LOCKED) encCount = encCountAccel = 0;
+
+  // Wake display from dim if any user interaction is detected
+  if(dimOn() && userIsActive)
+    dimOn(false);
 
   // Activate push and rotate mode (can span multiple loop iterations until the button is released)
   if (encCount && pb1st.isPressed) pushAndRotate = true;
@@ -925,7 +943,8 @@ void loop()
   // Disable commands control
   if((currentTime - elapsedCommand) > ELAPSED_COMMAND)
   {
-    // if(getCpuFrequencyMhz()!=80) setCpuFrequencyMhz(80);
+    // Drop CPU back to 80 MHz when idle to save power
+    if(getCpuFrequencyMhz()!=80) setCpuFrequencyMhz(80);
     if(currentCmd != CMD_NONE && currentCmd != CMD_SEEK && currentCmd != CMD_SCAN && currentCmd != CMD_MEMORY)
     {
       currentCmd = CMD_NONE;
@@ -942,6 +961,10 @@ void loop()
     // CPU sleep can take long time, renew the timestamps
     elapsedSleep = elapsedCommand = currentTime = millis();
   }
+
+  // Display dim timeout
+  if(currentDim && !dimOn() && !sleepOn() && ((currentTime - elapsedSleep) > currentDim * 1000))
+    dimOn(true);
 
   if((currentTime - elapsedRSSI) > MIN_ELAPSED_RSSI_TIME)
   {
@@ -973,6 +996,9 @@ void loop()
   // Tick preferences time, saving changes when there has
   // been no activity for a while
   prefsTickTime();
+
+  // Advance dim fade (no-op when not dimming)
+  dimTickTime();
 
   // Tick NETWORK time, connecting to WiFi if requested
   netTickTime();

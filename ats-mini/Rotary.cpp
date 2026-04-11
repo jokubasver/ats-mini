@@ -132,7 +132,7 @@ Rotary::Rotary(char _pin1, char _pin2) {
   state = R_START;
 }
 
-unsigned char Rotary::process() {
+ICACHE_RAM_ATTR unsigned char Rotary::process() {
   // Grab state of input pins
   unsigned char pinstate = (digitalRead(pin2) << 1) | digitalRead(pin1);
   // Determine new state from the pins and state table
