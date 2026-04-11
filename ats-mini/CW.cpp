@@ -1,6 +1,10 @@
 // CW (Morse code) decoder
 //
 // Decodes CW from an audio signal sampled on GPIO11/IO11.
+// Uses the Goertzel algorithm for frequency-selective tone detection at
+// the standard CW sidetone of 700 Hz, rejecting noise and interference
+// at other frequencies.
+//
 // Requires hardware modification: connect audio IC pin 8 to ESP32 IO11
 // through a lowpass RC filter to remove Class-D PWM switching noise.
 //
@@ -10,9 +14,7 @@
 
 #include "Common.h"
 #include "CW.h"
-
-// Number of ADC samples taken per cwTickTime() call
-#define CW_NUM_SAMPLES   16
+#include <math.h>
 
 // Morse binary tree table size (covers up to 5-element codes)
 #define MORSE_TREE_SIZE  64
@@ -22,11 +24,33 @@
 #define CW_MARK   1   // Signal is present (key down / tone detected)
 #define CW_SPACE  2   // Signal is absent (key up, timing the gap)
 
-// Signal envelope thresholds (out of a 0..2047 amplitude range).
-// Increase ON threshold if noise triggers false decoding;
+// -----------------------------------------------------------------------
+// Goertzel tone detector parameters
+// -----------------------------------------------------------------------
+//
+// Samples the ADC at CW_SAMPLE_RATE Hz and feeds blocks of CW_GOERTZEL_N
+// samples into the Goertzel algorithm tuned to the target CW tone.
+//
+// k = round(N * f_target / f_sample) = round(40 * 700 / 4000) = 7
+// Detected frequency = k * f_sample / N = 7 * 4000 / 40 = 700 Hz exactly
+//
+// Each block of 40 samples at 4000 Hz covers 10 ms — well below the
+// shortest dit at any practical CW speed.
+
+#define CW_SAMPLE_RATE   4000   // ADC sample rate in Hz
+#define CW_SAMPLE_US      250   // Sample interval in µs (= 1 000 000 / CW_SAMPLE_RATE)
+#define CW_GOERTZEL_N      40   // Samples per Goertzel block
+#define CW_GOERTZEL_K       7   // Bin index → 7 * 4000 / 40 = 700 Hz
+
+// Goertzel magnitude thresholds for mark/space detection.
+// For a pure sine at the target frequency with ADC amplitude A:
+//   magnitude ≈ N/2 * A = 20 * A
+// So CW_THRESHOLD_ON  = 1500 corresponds to A ≈ 75 ADC counts (of 0–4095).
+//    CW_THRESHOLD_OFF =  600 corresponds to A ≈ 30 ADC counts.
+// Increase CW_THRESHOLD_ON if noise triggers false decoding;
 // decrease it if weak signals are missed.
-#define CW_THRESHOLD_ON   200  // Envelope level to declare mark active
-#define CW_THRESHOLD_OFF   80  // Envelope level to declare mark inactive
+#define CW_THRESHOLD_ON   1500.0f  // Magnitude to declare tone present
+#define CW_THRESHOLD_OFF   600.0f  // Magnitude to declare tone absent
 
 // Timing parameters
 #define CW_MIN_MARK_MS    10   // Minimum mark duration — rejects short noise spikes
@@ -123,6 +147,14 @@ static uint32_t cwDitLen = CW_DEFAULT_DIT_MS;  // Adaptive dit estimate (ms)
 // Hysteresis state for mark/space detection
 static bool     cwMarkActive = false;
 
+// Goertzel filter state
+static float    cwGQ1 = 0.0f;          // s[n-1]
+static float    cwGQ2 = 0.0f;          // s[n-2]
+static int      cwGCount = 0;           // Sample count in current block
+static float    cwGCoeff = 0.0f;        // 2 * cos(2π * k / N), computed in cwInit()
+static float    cwEnvelope = 0.0f;      // Latest Goertzel magnitude
+static uint32_t cwLastSampleUs = 0;     // µs timestamp of last ADC sample
+
 // Long-term DC bias of the ADC input (12-bit, nominally 2048)
 static int32_t  cwDcBias = 2048;
 
@@ -183,28 +215,6 @@ static bool cwDecodeChar(void)
   return emitted;
 }
 
-// Take CW_NUM_SAMPLES ADC readings, update the DC bias estimate, and
-// return the mean absolute deviation from DC as the signal envelope.
-static uint16_t cwSampleLevel(void)
-{
-  int32_t sum    = 0;
-  int32_t absSum = 0;
-
-  for(int i = 0; i < CW_NUM_SAMPLES; i++)
-  {
-    int32_t s = analogRead(CW_ADC_PIN);
-    sum += s;
-    int32_t diff = s - cwDcBias;
-    absSum += (diff < 0 ? -diff : diff);
-  }
-
-  // Slowly track DC bias (EMA, time constant ≈ 64 calls).
-  // Compute error without intermediate integer division to reduce quantization.
-  cwDcBias += ((sum - cwDcBias * CW_NUM_SAMPLES) / CW_NUM_SAMPLES) >> 6;
-
-  return (uint16_t)(absSum / CW_NUM_SAMPLES);
-}
-
 // -----------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------
@@ -214,12 +224,20 @@ void cwInit(void)
   // Set full 3.3 V range on the CW ADC pin
   analogSetPinAttenuation(CW_ADC_PIN, ADC_11db);
 
+  // Precompute Goertzel coefficient: 2 * cos(2π * k / N)
+  cwGCoeff = 2.0f * cosf(2.0f * (float)M_PI * CW_GOERTZEL_K / (float)CW_GOERTZEL_N);
+
   cwState        = CW_IDLE;
   cwStateMs      = millis();
   cwCode         = 1;
   cwDitLen       = CW_DEFAULT_DIT_MS;
   cwMarkActive   = false;
   cwDcBias       = 2048;
+  cwGQ1          = 0.0f;
+  cwGQ2          = 0.0f;
+  cwGCount       = 0;
+  cwEnvelope     = 0.0f;
+  cwLastSampleUs = micros();
   cwTextLen      = 0;
   cwText[0]      = '\0';
   cwLetterDecoded = false;
@@ -232,10 +250,46 @@ bool cwTickTime(void)
   uint32_t now     = millis();
   bool     changed = false;
 
-  // Sample ADC and apply hysteresis to produce a clean mark/space signal
-  uint16_t level = cwSampleLevel();
-  if(!cwMarkActive && level > CW_THRESHOLD_ON)  cwMarkActive = true;
-  if( cwMarkActive && level < CW_THRESHOLD_OFF) cwMarkActive = false;
+  // -----------------------------------------------------------------------
+  // ADC sampling paced at CW_SAMPLE_RATE Hz using micros().
+  // One sample is taken per call if the target interval has elapsed.
+  // Each block of CW_GOERTZEL_N samples runs the Goertzel algorithm and
+  // updates cwMarkActive with hysteresis.
+  // -----------------------------------------------------------------------
+  uint32_t nowUs = micros();
+  if(nowUs - cwLastSampleUs >= (uint32_t)CW_SAMPLE_US)
+  {
+    // Advance timestamp by one period; if we've fallen more than one period
+    // behind (e.g. after a long redraw), resync to avoid a burst of samples.
+    cwLastSampleUs += CW_SAMPLE_US;
+    if(nowUs - cwLastSampleUs >= (uint32_t)CW_SAMPLE_US)
+      cwLastSampleUs = nowUs;
+
+    // Read ADC and remove slowly-tracked DC offset (α ≈ 1/256, τ ≈ 64 ms)
+    int32_t raw = analogRead(CW_ADC_PIN);
+    cwDcBias += (raw - cwDcBias) >> 8;
+    float x = (float)(raw - cwDcBias);
+
+    // Goertzel IIR iteration: s[n] = x[n] + coeff * s[n-1] - s[n-2]
+    float q0 = x + cwGCoeff * cwGQ1 - cwGQ2;
+    cwGQ2 = cwGQ1;
+    cwGQ1 = q0;
+
+    if(++cwGCount >= CW_GOERTZEL_N)
+    {
+      // Block complete.  Compute |X[k]|² = s²[N-1] + s²[N-2] - coeff * s[N-1] * s[N-2]
+      float mag2 = cwGQ1*cwGQ1 + cwGQ2*cwGQ2 - cwGCoeff * cwGQ1 * cwGQ2;
+      cwEnvelope = sqrtf(fabsf(mag2));
+
+      // Reset for next block
+      cwGQ1 = cwGQ2 = 0.0f;
+      cwGCount = 0;
+
+      // Update mark/space with hysteresis
+      if(!cwMarkActive && cwEnvelope > CW_THRESHOLD_ON)  cwMarkActive = true;
+      if( cwMarkActive && cwEnvelope < CW_THRESHOLD_OFF) cwMarkActive = false;
+    }
+  }
 
   bool isMark = cwMarkActive;
 
