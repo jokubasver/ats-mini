@@ -12,6 +12,8 @@
 #include <ESPAsyncWebServer.h>
 #include <NTPClient.h>
 #include <ESPmDNS.h>
+#include <esp_timer.h>
+#include <freertos/semphr.h>
 
 #define CONNECT_TIME  3000  // Time of inactivity to start connecting WiFi
 
@@ -19,15 +21,17 @@
 #define AUDIO_PIN          11    // GPIO11 – ADC input from NS4160 pin 8 via RC filter
 #define AUDIO_SAMPLE_RATE  8000  // 8 kHz sample rate
 #define AUDIO_CHUNK_SIZE   512   // Samples per WebSocket message (64 ms at 8 kHz)
-// AUDIO_BATCH: ADC reads per task wakeup.  Must satisfy:
-//   (AUDIO_BATCH * 1000) % AUDIO_SAMPLE_RATE == 0  (integer ms period)
-// 16 samples × 1 read each ≈ 1.2 ms → period = 2 ms (configTICK_RATE_HZ=1000).
-#define AUDIO_BATCH        16
+// AUDIO_BATCH: ADC reads per timer tick.  Timer fires at
+//   AUDIO_SAMPLE_RATE/AUDIO_BATCH Hz (125 Hz, period = 8 ms).
+// 64 reads × ~60 µs = ~3.84 ms active time, safely within the 8 ms
+// window even when the display task shares the same core.
+#define AUDIO_BATCH        64
 
 static uint8_t            audioChunk[2][AUDIO_CHUNK_SIZE]; // double buffer
 static volatile int       audioChunkIdx = 0;               // active write buffer
 static volatile int       audioChunkPos = 0;
-static volatile bool      audioRunning  = false;           // run flag shared between tasks
+static esp_timer_handle_t audioTimer    = nullptr;
+static SemaphoreHandle_t  audioSem      = nullptr;
 static AsyncWebSocket     audioWS("/audiows");
 static QueueHandle_t      audioSendQ    = nullptr;         // completed chunk indices → send task
 static TaskHandle_t       audioTaskH    = nullptr;
@@ -321,10 +325,12 @@ static bool wifiConnect()
 }
 
 //
-// Audio send task – runs on core 1 at FreeRTOS priority 0 (below loop/sampler).
+// Audio send task – runs on core 1 at FreeRTOS priority 1 (same as loop).
 // Receives completed buffer indices through a queue and calls binaryAll() only
 // after the sampler has already moved to the other buffer.  Keeping I/O here
 // prevents any TCP-stack stall from pausing ADC collection and causing ticks.
+// Priority 1 (not 0) ensures the display loop cannot starve this task and
+// cause the send queue to fill up, which would drop chunks and produce drop-outs.
 //
 static void audioSendTask(void *)
 {
@@ -340,27 +346,46 @@ static void audioSendTask(void *)
 }
 
 //
+// Audio timer callback – fires at AUDIO_SAMPLE_RATE/AUDIO_BATCH Hz (125 Hz).
+// Runs in the esp_timer task context on core 0.  Just wakes the audio task on
+// core 1 via a binary semaphore; all ADC reads happen there, away from WiFi.
+//
+static void audioTimerCB(void *)
+{
+  if(audioSem) xSemaphoreGive(audioSem);
+}
+
+//
 // Audio sampling task – runs on core 1 at priority 1 (same as loop).
-// Uses vTaskDelayUntil for accurate periodic wakeup without a hardware timer
-// or semaphore; the FreeRTOS scheduler guarantees the period even if one
-// wakeup runs long, so ticks are never dropped and the sample rate stays
-// stable (no pitch shift, no drop-outs).  Each wakeup reads AUDIO_BATCH
-// ADC samples then signals the lower-priority send task via a queue when a
-// full chunk is ready.
+// Wakes on each semaphore give (AUDIO_SAMPLE_RATE/AUDIO_BATCH = 125 times/sec),
+// then reads AUDIO_BATCH ADC samples.  A single-pole IIR high-pass filter
+// (~5 Hz cutoff) removes DC offset before the samples are stored, preventing
+// audible clicks at buffer boundaries caused by DC level changes between
+// sessions.
+//
+// Timing strategy: esp_timer (µs-precision) with skip_unhandled_events=true.
+// If the display task preempts and a tick is missed, the skipped tick is simply
+// dropped (a few silent samples) rather than caught up in a burst.  Catch-up
+// bursts (the vTaskDelayUntil behaviour) injected extra samples, making the
+// effective rate exceed 8 kHz and producing the "pitch too low" symptom.
 //
 static void audioTask(void *)
 {
-  // Period in FreeRTOS ticks: AUDIO_BATCH samples at AUDIO_SAMPLE_RATE Hz.
-  // 16 * 1000 / 8000 = 2 ms = 2 ticks at configTICK_RATE_HZ = 1000.
-  const TickType_t period = pdMS_TO_TICKS(1000UL * AUDIO_BATCH / AUDIO_SAMPLE_RATE);
-  TickType_t lastWake = xTaskGetTickCount();
-
-  while(audioRunning)
+  int32_t dcEst = 128 << 8;  // Q8 fixed-point DC estimate; reset fresh each session
+  while(xSemaphoreTake(audioSem, portMAX_DELAY) == pdTRUE)
   {
-    vTaskDelayUntil(&lastWake, period);
+    if(!audioTimer) break;  // stop signal
     for(int i = 0; i < AUDIO_BATCH; i++)
     {
-      audioChunk[audioChunkIdx][audioChunkPos++] = (uint8_t)(analogRead(AUDIO_PIN) >> 4);
+      // Scale 12-bit ADC → 8-bit unsigned PCM.
+      uint8_t raw = (uint8_t)(analogRead(AUDIO_PIN) >> 4);
+      // IIR DC-blocking high-pass: α = 1 - 1/256, cutoff ≈ 5 Hz at 8 kHz.
+      // dcEst tracks the running DC level in Q8 fixed-point (×256).
+      dcEst += (int32_t)raw - (dcEst >> 8);
+      int s = (int)raw - (dcEst >> 8) + 128;
+      if(s < 0)   s = 0;
+      if(s > 255) s = 255;
+      audioChunk[audioChunkIdx][audioChunkPos++] = (uint8_t)s;
       if(audioChunkPos >= AUDIO_CHUNK_SIZE)
       {
         int sendIdx   = audioChunkIdx;
@@ -378,29 +403,42 @@ static void audioTask(void *)
 
 static void startAudioSampling()
 {
-  if(audioRunning) return;
+  if(audioTimer) return;
   analogSetPinAttenuation(AUDIO_PIN, ADC_11db);
   audioChunkIdx = 0;
   audioChunkPos = 0;
-  audioRunning  = true;
 
   // Depth 2: one chunk queued for the send task while the next is filling.
   audioSendQ = xQueueCreate(2, sizeof(int));
+  audioSem   = xSemaphoreCreateBinary();
 
-  // Send task: lower priority (0) so WebSocket I/O never blocks ADC reads.
-  xTaskCreatePinnedToCore(audioSendTask, "audioSend", 4096, nullptr, 0, &audioSendH, 1);
+  // Send task: priority 1 (same as loop) so the display loop cannot starve it.
+  xTaskCreatePinnedToCore(audioSendTask, "audioSend", 4096, nullptr, 1, &audioSendH, 1);
 
-  // Sampler: priority 1 (same as loop), pinned to core 1, away from WiFi.
+  // Sampler: priority 1, pinned to core 1, away from WiFi stack on core 0.
   xTaskCreatePinnedToCore(audioTask, "audioADC", 8192, nullptr, 1, &audioTaskH, 1);
+
+  esp_timer_create_args_t args = {};
+  args.callback              = audioTimerCB;
+  args.dispatch_method       = ESP_TIMER_TASK;  // only dispatch method in ESP-IDF 5.1
+  args.name                  = "audioADC";
+  args.skip_unhandled_events = true;  // drop missed ticks; never catch up in a burst
+  esp_timer_create(&args, &audioTimer);
+  // Fire at AUDIO_SAMPLE_RATE/AUDIO_BATCH Hz (125 Hz, period = 8 ms).
+  esp_timer_start_periodic(audioTimer, 1000000ULL * AUDIO_BATCH / AUDIO_SAMPLE_RATE);
 }
 
 static void stopAudioSampling()
 {
-  if(!audioRunning) return;
-  audioRunning = false;
+  if(!audioTimer) return;
+  esp_timer_stop(audioTimer);
+  esp_timer_delete(audioTimer);
+  audioTimer = nullptr;
 
-  // Wait up to 10 ms for the sampler to finish its current sleep and exit.
-  for(int i = 0; i < 10 && audioTaskH; i++) vTaskDelay(1);
+  // Wake the sampler so it observes audioTimer == nullptr and exits.
+  // Wait up to 200 ms for the task to self-delete.
+  if(audioSem) xSemaphoreGive(audioSem);
+  for(int i = 0; i < 200 && audioTaskH; i++) vTaskDelay(1);
 
   // Send a poison pill to wake and stop the send task.
   if(audioSendQ)
@@ -410,7 +448,8 @@ static void stopAudioSampling()
   }
   for(int i = 0; i < 200 && audioSendH; i++) vTaskDelay(1);
 
-  if(audioSendQ) { vQueueDelete(audioSendQ); audioSendQ = nullptr; }
+  if(audioSem)  { vSemaphoreDelete(audioSem);  audioSem  = nullptr; }
+  if(audioSendQ){ vQueueDelete(audioSendQ);     audioSendQ = nullptr; }
   audioChunkIdx = 0;
   audioChunkPos = 0;
 }
@@ -673,31 +712,43 @@ static const String webAudioPage()
 "<TR><TD CLASS='CENTER' ID='st'>Press Start to listen</TD></TR>"
 "</TABLE>"
 "<SCRIPT>"
-"var ctx=null,ws=null,npt=0,JITTER=0.3;"
+// Ring-buffer + ScriptProcessorNode approach.
+// A single ScriptProcessorNode pulls samples continuously from an 8192-sample
+// (1-second) ring buffer, eliminating the per-chunk AudioBufferSource boundary
+// clicks (~15 Hz ticking) that the previous approach produced.  The ring buffer
+// also absorbs short-term network jitter without gaps.  Playback starts only
+// after FILL samples have accumulated (200 ms pre-buffer), ensuring a smooth
+// start even over slower WiFi.
+"var ctx=null,ws=null,proc=null;"
+"var RING=8192,FILL=1600,ring=new Float32Array(8192),wp=0,rp=0,playing=false;"
+"function avail(){return(wp-rp+RING)&(RING-1);}"
 "function startAudio(){"
   "if(ws)return;"
   "if(!ctx||ctx.state==='closed')ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:8000});"
   "ctx.resume();"
+  "proc=ctx.createScriptProcessor(512,1,1);"
+  "proc.onaudioprocess=function(e){"
+    "var out=e.outputBuffer.getChannelData(0),av=avail();"
+    "if(!playing&&av>=FILL)playing=true;"
+    "for(var i=0;i<out.length;i++){"
+      "if(playing&&av>0){out[i]=ring[rp];rp=(rp+1)&(RING-1);av--;}"
+      "else{out[i]=0;if(playing)playing=false;}"
+    "}"
+  "};"
+  "proc.connect(ctx.destination);"
+  "wp=0;rp=0;playing=false;"
   "ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/audiows');"
   "ws.binaryType='arraybuffer';"
   "ws.onopen=function(){"
     "if(ctx&&ctx.state==='suspended')ctx.resume();"
-    "npt=0;"
     "document.getElementById('st').textContent='Streaming...';"
   "};"
   "ws.onmessage=function(e){"
-    "if(!ctx||ctx.state==='closed')return;"
     "var b=new Uint8Array(e.data);"
-    "var a=ctx.createBuffer(1,b.length,8000);"
-    "var d=a.getChannelData(0);"
-    "for(var i=0;i<b.length;i++)d[i]=b[i]/128.0-1.0;"
-    "var s=ctx.createBufferSource();"
-    "s.buffer=a;s.connect(ctx.destination);"
-    "var n=ctx.currentTime;if(npt<n)npt=n+JITTER;"
-    "s.start(npt);npt+=b.length/8000;"
+    "for(var i=0;i<b.length;i++){var nx=(wp+1)&(RING-1);if(nx!==rp){ring[wp]=b[i]/128.0-1.0;wp=nx;}}"
   "};"
   "ws.onclose=function(){"
-    "ws=null;npt=0;"
+    "ws=null;playing=false;"
     "document.getElementById('sta').disabled=false;"
     "document.getElementById('sto').disabled=true;"
     "document.getElementById('st').textContent='Disconnected - click Start to retry';"
@@ -707,8 +758,9 @@ static const String webAudioPage()
 "}"
 "function stopAudio(){"
   "if(ws){ws.onclose=null;ws.close();ws=null;}"
+  "if(proc){proc.disconnect();proc=null;}"
   "if(ctx){ctx.close();ctx=null;}"
-  "npt=0;"
+  "wp=0;rp=0;playing=false;"
   "document.getElementById('sta').disabled=false;"
   "document.getElementById('sto').disabled=true;"
   "document.getElementById('st').textContent='Stopped';"
